@@ -1,0 +1,76 @@
+# Publishes dist/index.json as an asset on one long-lived prerelease.
+#
+# The tag is created once and NEVER re-pointed. What this workflow replaces is the asset on
+# the release, which is why a harness can hard-code
+# `releases/download/nightly/index.json` and never ask which release is newest: "latest
+# nightly" is a name the publisher resolves, not a search a client performs.
+#
+# A release asset rather than the Pages site, for the deployments reading it: a plain file
+# download costs none of the unauthenticated 60/hour GitHub API budget that every harness
+# behind one address shares, and it is served by the same CDN as the installers. Pages keeps
+# serving the human-facing page (deploy.yml); this is the machine-facing copy.
+#
+# Every six hours rather than on push: the index changes when a submission merges, and a
+# deployment caches it for 30 minutes anyway, so a fixed cadence costs nothing a push trigger
+# would have saved and keeps the asset fresh when `updatedAt` moves under an unchanged tree.
+name: Nightly index
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+# Never two writers on one asset. Not cancel-in-progress: a half-replaced asset is what
+# every deployment would then read.
+concurrency:
+  group: nightly-index
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Replace the nightly index asset
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.repository == 'Prism-Shadow/penguin-extensions'
+    steps:
+      # Full history: `updatedAt` comes from each manifest's last commit.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+      # A build that produced nothing readable must not replace a working asset: every
+      # deployment reads this file, and an empty or malformed one empties their listing.
+      - name: Check the built index before it replaces anything
+        run: |
+          node -e '
+            const doc = JSON.parse(require("node:fs").readFileSync("dist/index.json", "utf8"));
+            if (!Array.isArray(doc)) throw new Error("index.json is not an array");
+            console.log(`index.json holds ${doc.length} entries`);
+          '
+
+      # `--clobber` replaces the asset in place; the release and its tag are untouched.
+      # Created on first run so the workflow is self-sufficient in a fresh fork.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view nightly >/dev/null 2>&1; then
+            gh release create nightly \
+              --prerelease \
+              --title "Nightly index" \
+              --notes "The extension index, rebuilt from the manifests on this repository's main branch. The asset on this release is replaced in place; the tag never moves." \
+              --target main
+          fi
+          gh release upload nightly dist/index.json --clobber

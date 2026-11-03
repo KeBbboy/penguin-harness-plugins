@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check submissions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Full history: `updatedAt` comes from each manifest's last commit, and the
+      # change-level rules diff against the merge base with the target branch.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Fetch the base branch
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags origin \
+            "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm format:check
+
+      - name: Validate manifests
+        run: pnpm validate
+        env:
+          BASE_REF: origin/${{ github.base_ref || 'main' }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+
+      # Only the manifests this PR touches: a third party's registry hiccup must not
+      # turn the whole index red.
+      - name: Check changed extensions against npm
+        run: pnpm check-npm
+        env:
+          BASE_REF: origin/${{ github.base_ref || 'main' }}
+
+      - name: Build the index
+        run: pnpm build

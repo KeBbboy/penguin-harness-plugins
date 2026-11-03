@@ -1,0 +1,16 @@
+name: Problem with the index
+description: The checks, the docs, the published index.json, or the submission process.
+labels: ["index"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What went wrong
+      description: If a check rejected a valid submission, paste the CI output.
+    validations:
+      required: true
+  - type: input
+    id: extension
+    attributes:
+      label: Extension involved
+      description: The npm package name, if this is about a specific entry.
