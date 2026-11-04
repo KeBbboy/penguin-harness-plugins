@@ -78,16 +78,15 @@ flat JSON array of entries — the same shape a machine's plugin store writes to
     "repository": "https://github.com/acme/widgets",
     "keywords": ["widgets", "linux"],
     "categories": ["tool"],
-    "integrity": "sha256-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "integrity": "sha512-O7Eu2jwpjbXeJVl/VNkk8uF+eKJq2JU+2CGO5oLwu76QIeLzAJ0VLJEb8fJexoOpAnFBZnZ6+9jlvQ+wEk7Lig==",
     "updatedAt": 1755000000
   }
 ]
 ```
 
 A name may appear more than once — several versions, or several contents of one version
-— and the consumer picks by semver. Before it stores a package it fetched, it installs
-the package the way the index did and compares the hash with `integrity`; a package
-whose hash differs is refused.
+— and the consumer picks by semver. Before it stores a package it fetched, it hashes the
+tarball against `integrity`; a package whose hash differs is refused.
 
 Consumers should ignore fields they do not know: new optional fields are added without
 a schema break, and an entry's name, version and integrity never change — a new
