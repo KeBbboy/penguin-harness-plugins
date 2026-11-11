@@ -117,8 +117,10 @@ class ExploreRun:
             "events": self.record.dump(),
             "deviations": [
                 "single shared environment; branches run sequentially, not in independent VMs",
-                "role isolation is API-level (Verifier never receives Actor memory or reasoning), not OS-level",
-                "no QEMU rollback; the Docker verifier boundary is available but not used for these calls",
+                "Verifier isolation is the restricted Docker container (readonly, no network, "
+                "no capabilities, NoNewPrivs); Actor memory and reasoning never enter it, but "
+                "the Curriculum and Actor still share this host process",
+                "no QEMU rollback; the verifier container is stateless so no rollback is needed",
             ],
         }
 
