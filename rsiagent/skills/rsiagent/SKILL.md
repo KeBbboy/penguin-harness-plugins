@@ -31,11 +31,22 @@ unresolved verification blocks that wave from committing memory. Each lesson
 should state conditions, action, observable outcome, and supporting evidence;
 keep failures and uncertainty rather than inventing a causal rule.
 
-In deep exploration, attempt the selected development target first. After Actor
-distills the verified attempt, Curriculum may request focused practice or signal
-readiness. If practice occurs, attempt the unchanged target again before stopping.
-Respect the chosen budget and distinguish an exhausted budget or infrastructure
-failure from successful completion.
+In deep exploration, attempt the unchanged development target first. Keep one
+target-scoped Curriculum session across routing and practice. A Verifier FAIL
+goes to Curriculum: REVISE returns the complete verifier report to the same
+Actor and keeps the current attempt; EVOLVE lets that Actor distill the verified
+failure, suspends the attempt, and starts focused practice. During practice,
+Curriculum may select multiple projects before READY_FOR_RETRY; only then start
+a fresh attempt at the unchanged target. STALLED and budget exhaustion are
+reported separately from success.
+
+After a Verifier PASS, Curriculum may choose HANDOFF or VERIFY_MORE. VERIFY_MORE
+returns the review report to the same Verifier and rechecks the same candidate;
+it does not change the candidate or turn a PASS into a FAIL by itself. Only the
+Verifier's new verdict can do that. Treat an incomplete verification or missing
+report as unverified, not a PASS. Keep role histories separate and do not send
+Actor-private memory or reasoning to Verifier. The host must enforce the stated
+isolation rather than relying on these instructions.
 
 A fresh subagent conversation alone does not isolate shared files or processes.
 If the host cannot hide Actor-private artifacts and prevent verifier modifications

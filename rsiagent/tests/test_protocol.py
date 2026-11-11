@@ -44,6 +44,19 @@ class Tests(unittest.TestCase):
             p.broad_wave(["a"])
         self.assertEqual(p.memory, ["seed"])
 
+    def test_failed_consolidation_does_not_partially_commit_wave(self):
+        host = Host()
+        def consolidate(memory, task, candidate, verdict):
+            if task == "b":
+                raise RuntimeError("distillation failed")
+            return memory + [task]
+        host.consolidate = consolidate
+        p = Protocol(host, ["seed"])
+        with self.assertRaisesRegex(RuntimeError, "distillation failed"):
+            p.broad_wave(["a", "b"])
+        self.assertEqual(p.memory, ["seed"])
+        self.assertEqual(p.events, [])
+
     def test_deep_practices_and_retries_target(self):
         host = Host()
         p = Protocol(host)

@@ -1,12 +1,9 @@
-"""End-to-end run 4: day-diff with a WIDER training wave.
+"""Opt-in wide day-count pilot with an untouched holdout.
 
-Run 3 measured baseline 0/3 vs evolved 1/3 with a 2-task wave. This run
-multiplies the wave: two waves of four tasks each before the deep phase,
-so the correct day-of-year method has more chances to be discovered,
-verified and consolidated into the frozen memory. Verifier is the
-container ground truth (runtime/evidence.py — wired, not hand-rolled).
+Historical results used an incorrect oracle and must not be interpreted as a gain.
 """
 import json
+from datetime import datetime, timezone
 import os
 import sys
 from pathlib import Path
@@ -29,7 +26,7 @@ DATE_PROGRAM = (
     "dates = re.findall(r'(\\d{4}-\\d{2}-\\d{2})', task)\n"
     "a = date(*map(int, dates[0].split('-')))\n"
     "b = date(*map(int, dates[1].split('-')))\n"
-    "expected = (b - a).days\n"
+    "expected = max(0, (b - a).days - 1)\n"
     "try:\n"
     "    ok = int(str(answer).strip()) == expected\n"
     "except ValueError:\n"
@@ -38,34 +35,34 @@ DATE_PROGRAM = (
 )
 
 HELD_OUT = [
-    "days between 2026-03-15 and 2026-11-04 (inclusive of neither)",  # 234
-    "days between 2025-06-10 and 2026-02-17 (inclusive of neither)",  # 252
-    "days between 2024-01-05 and 2024-12-30 (inclusive of neither)",  # 360
+    "days between 2026-03-15 and 2026-11-04 (inclusive of neither)",
+    "days between 2025-06-10 and 2026-02-17 (inclusive of neither)",
+    "days between 2024-01-05 and 2024-12-30 (inclusive of neither)",
 ]
-DEEP_TARGET = HELD_OUT[0]
+DEEP_TARGET = "days between 2023-04-12 and 2024-01-27 (inclusive of neither)"
 
 # Wave 1: short spans (off-by-one is most visible here).
 WAVE1 = [
-    "days between 2026-01-01 and 2026-01-05 (inclusive of neither)",   # 4
-    "days between 2025-02-14 and 2025-03-14 (inclusive of neither)",   # 28
-    "days between 2026-07-01 and 2026-07-08 (inclusive of neither)",   # 7
-    "days between 2025-12-30 and 2026-01-03 (inclusive of neither)",   # 4
+    "days between 2026-01-01 and 2026-01-05 (inclusive of neither)",
+    "days between 2025-02-14 and 2025-03-14 (inclusive of neither)",
+    "days between 2026-07-01 and 2026-07-08 (inclusive of neither)",
+    "days between 2025-12-30 and 2026-01-03 (inclusive of neither)",
 ]
 # Wave 2: month-boundary spans, where the count must cross months.
 WAVE2 = [
-    "days between 2026-04-15 and 2026-06-15 (inclusive of neither)",   # 61
-    "days between 2025-09-20 and 2025-11-05 (inclusive of neither)",   # 46
-    "days between 2026-02-10 and 2026-05-10 (inclusive of neither)",   # 89
-    "days between 2024-11-11 and 2025-02-11 (inclusive of neither)",   # 92
+    "days between 2026-04-15 and 2026-06-15 (inclusive of neither)",
+    "days between 2025-09-20 and 2025-11-05 (inclusive of neither)",
+    "days between 2026-02-10 and 2026-05-10 (inclusive of neither)",
+    "days between 2024-11-11 and 2025-02-11 (inclusive of neither)",
 ]
 
 HINT = ("Hint: the day-of-year method is exact — compute each date's "
         "ordinal day-of-year (and add 366/365 for each full year crossed), "
-        "then subtract. Counting months by hand is error-prone.")
+        "then subtract one to exclude both endpoints. Counting months by hand is error-prone.")
 
 
 def main():
-    out_path = Path(__file__).resolve().parents[1] / "explore-report-daydiff-wide.json"
+    out_path = Path(__file__).resolve().parents[1] / ("explore-report-daydiff-wide-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + ".json")
 
     # --- baseline: no memory on the held-out set ---------------------------
     base_client = ChatClient(BASE, KEY, MODEL)
@@ -89,19 +86,12 @@ def main():
 
     waves = []
     for wave in (WAVE1, WAVE2):
-        verdicts_w = []
-        for task in wave:
-            cand, v = run.protocol._attempt(task, [])
-            run.protocol._commit(task, cand, v)
-            verdicts_w.append(v)
+        verdicts_w = run.protocol.broad_wave(wave, workers=1)
         waves.append({"tasks": wave, "verdicts": verdicts_w})
 
-    # a second pass over wave 1 after failures: retry once with the hint
-    retry_verdicts = []
-    for task in WAVE1:
-        cand, v = run.protocol._attempt(task + ". " + HINT, [])
-        run.protocol._commit(task + ". " + HINT, cand, v)
-        retry_verdicts.append(v)
+    # A second wave uses a new shared memory snapshot.
+    retry_verdicts = run.protocol.broad_wave(
+        [task + ". " + HINT for task in WAVE1], workers=1)
 
     deep_verdict = run.protocol.deep(DEEP_TARGET + ". " + HINT, 2)
 
@@ -128,7 +118,8 @@ def main():
         "baseline_pass": b_pass, "evolved_pass": e_pass, "n_tasks": len(HELD_OUT),
         "frozen_unchanged": frozen.sha256 == run.protocol.freeze().sha256,
     }
-    out_path.write_text(json.dumps(report, ensure_ascii=False, indent=1))
+    with out_path.open("x", encoding="utf-8") as output:
+        json.dump(report, output, ensure_ascii=False, indent=1)
     print(json.dumps({k: report[k] for k in (
         "role_calls", "retry_verdicts", "deep_verdict", "baseline_pass",
         "evolved_pass", "correct_lessons", "frozen_lessons",

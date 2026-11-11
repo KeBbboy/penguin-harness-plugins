@@ -1,5 +1,6 @@
 """Tests for the evidence-based verifier wiring (runtime/evidence.py)."""
 import os
+import tempfile
 import sys
 import unittest
 from pathlib import Path
@@ -17,7 +18,7 @@ DATE_PROGRAM = (
     "dates = re.findall(r'(\\d{4}-\\d{2}-\\d{2})', task)\n"
     "a = date(*map(int, dates[0].split('-')))\n"
     "b = date(*map(int, dates[1].split('-')))\n"
-    "expected = (b - a).days\n"
+    "expected = max(0, (b - a).days - 1)\n"
     "try:\n"
     "    ok = int(str(answer).strip()) == expected\n"
     "except ValueError:\n"
@@ -35,9 +36,34 @@ class EvidenceTests(unittest.TestCase):
     def test_date_ground_truth(self):
         verify = container_verifier(DATE_PROGRAM)
         task = "days between 2026-03-15 and 2026-11-04 (inclusive of neither)"
-        self.assertEqual(verify(task, {"answer": "234"}), "PASS")
-        self.assertEqual(verify(task, {"answer": "233"}), "FAIL")
+        self.assertEqual(verify(task, {"answer": "233"}), "PASS")
+        self.assertEqual(verify(task, {"answer": "234"}), "FAIL")
         self.assertEqual(verify(task, {"answer": "not a number"}), "FAIL")
+
+    def test_explicit_candidate_directory_is_read_only_and_private_files_hidden(self):
+        with tempfile.TemporaryDirectory(prefix="rsi-evidence-", dir=str(Path.home())) as work:
+            root = Path(work)
+            root.chmod(0o755)
+            candidate = root / "candidate"
+            candidate.mkdir(mode=0o755)
+            (candidate / "public.txt").write_text("verified")
+            (root / "private.txt").write_text("private")
+            program = (
+                "from pathlib import Path\n"
+                "p = Path('/candidate/public.txt')\n"
+                "assert p.read_text() == 'verified'\n"
+                "assert not Path('/private.txt').exists()\n"
+                "try:\n"
+                " p.write_text('changed')\n"
+                "except OSError:\n"
+                " print('PASS')\n"
+                "else:\n"
+                " print('FAIL')\n"
+            )
+            verify = container_verifier(program, candidate_dir=candidate)
+            self.assertEqual(verify("task", {"answer": "value"}), "PASS")
+            self.assertEqual((candidate / "public.txt").read_text(), "verified")
+            self.assertIn("caller-selected candidate", verify.verifier_mode)
 
     def test_unusable_verdict_rejected(self):
         verify = container_verifier("print('MAYBE')\n")
@@ -56,9 +82,9 @@ class EvidenceTests(unittest.TestCase):
         })()
         host = EvidenceHost(model_host, container_verifier(DATE_PROGRAM))
         task = "days between 2026-03-15 and 2026-11-04 (inclusive of neither)"
-        # candidate 234 is correct -> container PASS, and the ModelHost's
+        # candidate 233 is correct -> container PASS, and the ModelHost's
         # model-judgement verify() must never have been called.
-        self.assertEqual(host.verify(task, {"answer": "234"}), "PASS")
+        self.assertEqual(host.verify(task, {"answer": "233"}), "PASS")
         self.assertNotIn("model_verify", seen)
 
 

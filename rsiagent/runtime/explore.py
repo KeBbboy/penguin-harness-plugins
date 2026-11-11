@@ -21,6 +21,7 @@ reported, not hidden: single shared environment, API-level role isolation
 rather than independent VMs, and no QEMU rollback.
 """
 import json
+import unicodedata
 from rsi import Protocol
 from model_host import ChatClient, ModelHost, LLMError
 
@@ -66,14 +67,27 @@ class ExperimentRecord:
 class ExploreRun:
     """One full broad-then-deep exploration over a training domain."""
 
-    def __init__(self, client, max_practices=2, log=None):
+    def __init__(self, client, max_practices=2, log=None, host=None, held_out=()):
+        self._held_out = {self._task_key(task) for task in held_out}
         self.client = client
-        self.host = ModelHost(client)
+        self.host = host if host is not None else ModelHost(client)
         self.record = ExperimentRecord()
         if log is not None:
             self.client.log = log
         self.max_practices = max_practices
-        self.protocol = Protocol(self.host)
+        self.protocol = Protocol(self.host, training_validator=self._reject_held_out)
+
+    @staticmethod
+    def _task_key(task):
+        if not isinstance(task, str) or not task.strip():
+            raise ValueError("tasks must be nonempty strings")
+        return " ".join(unicodedata.normalize("NFKC", task).casefold().split())
+
+    def _reject_held_out(self, task):
+        # Exact normalized matches only. This cannot detect paraphrases or
+        # semantic overlap; callers must independently design disjoint splits.
+        if self._task_key(task) in self._held_out:
+            raise ValueError("held-out task cannot be used during exploration")
 
     # --- 1. broad ---------------------------------------------------------
     def broad(self, domain, wave_size=2):
@@ -83,6 +97,8 @@ class ExploreRun:
             "Plan the next broad wave of training tasks:".format(
                 domain, json.dumps(self.protocol.memory, ensure_ascii=False)))
         tasks = _parse_tasks(reply, limit=wave_size)
+        for task in tasks:
+            self._reject_held_out(task)
         self.record.add("wave_plan", tasks=tasks)
         verdicts = self.protocol.broad_wave(tasks, workers=1)
         self.record.add("wave_verdicts", tasks=tasks, verdicts=verdicts)
@@ -90,9 +106,23 @@ class ExploreRun:
 
     # --- 2. deep ----------------------------------------------------------
     def deep(self, target):
+        self._reject_held_out(target)
         verdict = self.protocol.deep(target, self.max_practices)
         self.record.add("deep", target=target, verdict=verdict)
         return verdict
+
+    def deep_unified(self, target):
+        """Run the unified routing prototype using separate model role histories."""
+        from unified import run_unified
+        from unified_model_host import UnifiedModelHost
+        self._reject_held_out(target)
+        host = UnifiedModelHost(self.client, training_validator=self._reject_held_out)
+        result = run_unified(host, target, self.protocol.memory,
+                             max_practices=self.max_practices)
+        self.protocol.memory = result.memory
+        self.record.add("deep_unified", target=target, status=result.status,
+                        events=list(result.events))
+        return result.status
 
     # --- 3. freeze ----------------------------------------------------------
     def freeze(self):
@@ -117,17 +147,17 @@ class ExploreRun:
             "events": self.record.dump(),
             "deviations": [
                 "single shared environment; branches run sequentially, not in independent VMs",
-                "Verifier isolation is the restricted Docker container (readonly, no network, "
-                "no capabilities, NoNewPrivs); Actor memory and reasoning never enter it, but "
-                "the Curriculum and Actor still share this host process",
-                "no QEMU rollback; the verifier container is stateless so no rollback is needed",
+                "verifier mode: " + getattr(self.host, "verifier_mode", "caller-supplied"),
+                "no claim of independent VM isolation or QEMU rollback",
             ],
         }
 
 
 def run(domain, target, held_out, client, max_practices=2):
     """Drive one full experiment: broad wave -> deep target -> freeze -> evaluate."""
-    run_state = ExploreRun(client, max_practices=max_practices)
+    held_out = list(held_out)
+    run_state = ExploreRun(client, max_practices=max_practices, held_out=held_out)
+    run_state._reject_held_out(target)
     run_state.broad(domain)
     deep_verdict = run_state.deep(target)
     frozen = run_state.freeze()

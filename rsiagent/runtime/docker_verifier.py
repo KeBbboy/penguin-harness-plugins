@@ -18,17 +18,19 @@ _BOOTSTRAP = (
 
 def verify_in_container(candidate_dir, command, input_data="", *,
                         image="python:3.11-slim", timeout=30):
-    candidate = Path(candidate_dir).resolve(strict=True)
-    if not candidate.is_dir():
+    candidate = None if candidate_dir is None else Path(candidate_dir).resolve(strict=True)
+    if candidate is not None and not candidate.is_dir():
         raise ValueError("candidate must be a directory")
     if not command or not all(isinstance(x, str) and x for x in command):
         raise ValueError("command must be a nonempty argument list")
-    mount = "type=bind,src=" + str(candidate) + ",dst=/candidate,readonly"
+    # No host path is mounted unless explicitly requested by the caller.
     args = ["docker", "run", "--rm", "--network", "none", "--read-only",
             "--cap-drop", "ALL",
             "--pids-limit", "64", "--memory", "256m", "--cpus", "1",
-            "--user", "65534:65534", "--tmpfs", "/tmp:rw,noexec,nosuid,size=16m",
-            "--mount", mount, "--workdir", "/candidate", "-i", image,
-            "python", "-I", "-c", _BOOTSTRAP, *command]
+            "--user", "65534:65534", "--tmpfs", "/tmp:rw,noexec,nosuid,size=16m"]
+    if candidate is not None:
+        args.extend(["--mount", "type=bind,src=" + str(candidate) +
+                     ",dst=/candidate,readonly", "--workdir", "/candidate"])
+    args.extend(["-i", image, "python", "-I", "-c", _BOOTSTRAP, *command])
     return subprocess.run(args, input=input_data, text=True, capture_output=True,
                           check=True, timeout=timeout)

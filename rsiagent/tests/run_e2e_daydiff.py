@@ -1,14 +1,9 @@
-"""End-to-end run 3: day-count differences (a real model-failure family).
+"""Opt-in day-count pilot; excludes both endpoints and keeps holdout separate.
 
-Measured probe 2026-11-11: the bare model answers 233/251/359 on
-"days between A and B (inclusive of neither)" where the truth is
-234/252/360 — a systematic off-by-one (it counts an endpoint).
-A frozen lesson about endpoint semantics can plausibly fix this, and the
-Verifier judges against date arithmetic computed inside the restricted
-Docker container (environment evidence, not model opinion).
-Key is read from RSI_API_KEY (never written to disk).
+Historical results used an incorrect oracle and must not be interpreted as a gain.
 """
 import json
+from datetime import datetime, timezone
 import os
 import sys
 from pathlib import Path
@@ -26,17 +21,17 @@ BASE = os.environ.get("RSI_BASE_URL", "http://100.64.0.88:7864/v1")
 MODEL = os.environ.get("RSI_MODEL", "deepseek-v4.1-flash")
 
 HELD_OUT = [
-    "days between 2026-03-15 and 2026-11-04 (inclusive of neither)",  # 234
-    "days between 2025-06-10 and 2026-02-17 (inclusive of neither)",  # 252
-    "days between 2024-01-05 and 2024-12-30 (inclusive of neither)",  # 360
+    "days between 2026-03-15 and 2026-11-04 (inclusive of neither)",
+    "days between 2025-06-10 and 2026-02-17 (inclusive of neither)",
+    "days between 2024-01-05 and 2024-12-30 (inclusive of neither)",
 ]
 TRAIN_TASKS = [
-    "days between 2026-01-01 and 2026-01-05 (inclusive of neither)",   # 4
-    "days between 2025-02-14 and 2025-03-14 (inclusive of neither)",   # 28
+    "days between 2026-01-01 and 2026-01-05 (inclusive of neither)",
+    "days between 2025-02-14 and 2025-03-14 (inclusive of neither)",
 ]
-DEEP_TARGET = HELD_OUT[0]
+DEEP_TARGET = "days between 2023-04-12 and 2024-01-27 (inclusive of neither)"
 
-# Verifier: computes (B - A).days inside the restricted container.
+# Verifier: counts dates strictly between A and B.
 VERIFY_PROBE = (
     "import sys\n"
     "task, answer = sys.argv[-2:]\n"
@@ -45,7 +40,7 @@ VERIFY_PROBE = (
     "dates = re.findall(r\"(\\d{4}-\\d{2}-\\d{2})\", task)\n"
     "a = date(*map(int, dates[0].split(\"-\")))\n"
     "b = date(*map(int, dates[1].split(\"-\")))\n"
-    "expected = (b - a).days\n"
+    "expected = max(0, (b - a).days - 1)\n"
     "try:\n"
     "    ok = int(str(answer).strip()) == expected\n"
     "except ValueError:\n"
@@ -55,7 +50,7 @@ VERIFY_PROBE = (
 
 def container_verify(task, public):
     result = verify_in_container(
-        "/tmp", ["python", "-I", "-c", VERIFY_PROBE, "--", task, str(public["answer"])])
+        None, ["python", "-I", "-c", VERIFY_PROBE, "--", task, str(public["answer"])])
     verdict = result.stdout.strip().splitlines()[-1]
     if verdict not in ("PASS", "FAIL"):
         raise RuntimeError("container verifier returned: " + verdict[:100])
@@ -81,7 +76,7 @@ class ContainerVerifyHost:
 
 
 def main():
-    out_path = Path(__file__).resolve().parents[1] / "explore-report-daydiff.json"
+    out_path = Path(__file__).resolve().parents[1] / ("explore-report-daydiff-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + ".json")
 
     # --- baseline: no memory, all tasks ------------------------------------
     base_client = ChatClient(BASE, KEY, MODEL)
@@ -102,11 +97,7 @@ def main():
     run.max_practices = 2
     run.protocol = Protocol(host)
 
-    verdicts_w = []
-    for task in TRAIN_TASKS:
-        cand, v = run.protocol._attempt(task, [])
-        run.protocol._commit(task, cand, v)
-        verdicts_w.append(v)
+    verdicts_w = run.protocol.broad_wave(TRAIN_TASKS, workers=1)
 
     deep_verdict = run.protocol.deep(DEEP_TARGET, 2)
 
@@ -134,7 +125,8 @@ def main():
         "frozen_unchanged": frozen.sha256 == run.protocol.freeze().sha256,
         "verifier_isolated_from_actor_memory": True,
     }
-    out_path.write_text(json.dumps(report, ensure_ascii=False, indent=1))
+    with out_path.open("x", encoding="utf-8") as output:
+        json.dump(report, output, ensure_ascii=False, indent=1)
     print(json.dumps({k: report[k] for k in (
         "role_calls", "wave_verdicts", "deep_verdict", "baseline_pass",
         "evolved_pass", "n_tasks", "frozen_unchanged")}, ensure_ascii=False))
