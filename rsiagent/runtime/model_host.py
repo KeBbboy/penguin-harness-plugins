@@ -154,6 +154,7 @@ class ChatClient:
         # and return empty content; one bounded retry with a larger budget
         # recovers it without masking a persistent failure.
         text = ""
+        last_text = ""
         last_error = None
         diag = []
         budgets = [max_tokens]
@@ -179,11 +180,21 @@ class ChatClient:
             except (KeyError, IndexError, TypeError) as exc:
                 last_error = exc
                 continue
-            if text:
+            if text and finish != "length":
                 break
+            if text and finish == "length":
+                # Truncated JSON is worse than no answer: retry with more room
+                # and keep this text only as a last resort.
+                last_text = text
+                diag.append({"finish": finish, "truncated": True,
+                             "usage": payload.get("usage")})
+                text = ""
+                continue
             text = ""
             diag.append({"finish": finish,
                          "usage": payload.get("usage")})
+        if not text and last_text:
+            text = last_text
         if not text:
             if last_error is not None:
                 raise LLMError(role + " call failed: " + repr(last_error)
