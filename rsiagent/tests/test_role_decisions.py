@@ -42,11 +42,36 @@ class RoleDecisionTests(unittest.TestCase):
         self.assertEqual(client.requests[0][0], "actor")
 
     def test_incomplete_lesson_rejected_without_updating_prior(self):
-        host = ModelHost(Client(['{"condition":"x"}']))
+        # The first malformed reply is restated once; two failures are final.
+        client = Client(['{"condition":"x"}', "still not a lesson"])
+        host = ModelHost(client)
         prior = ["unchanged"]
         with self.assertRaises(LLMError):
-            host.consolidate(prior, "task", SimpleNamespace(public={"answer": "x"}), "FAIL")
+            host.consolidate(prior, "task", SimpleNamespace(public={"answer": "x"}),
+                             "FAIL")
         self.assertEqual(prior, ["unchanged"])
+        self.assertEqual(client.calls["actor"], 2)
+
+    def test_a_malformed_lesson_is_restated_once_and_then_accepted(self):
+        good = {"condition": "file written", "action": "read it back",
+                "outcome": "bytes matched", "support": "od output"}
+        client = Client(["not JSON at all", json.dumps(good)])
+        host = ModelHost(client)
+        updated = host.consolidate([], "write a file",
+                                   SimpleNamespace(public={"answer": "ok"}), "PASS")
+        self.assertEqual(updated[-1]["condition"], "file written")
+        self.assertEqual(client.calls["actor"], 2)
+        self.assertIn("Your previous reply was unusable", client.requests[1][2])
+
+    def test_the_restatement_count_is_configurable(self):
+        client = Client(['{"condition":"x"}', '{"condition":"x"}',
+                         '{"condition":"x"}'])
+        host = ModelHost(client, memory_attempts=3)
+        with self.assertRaises(LLMError):
+            host.consolidate([], "t", SimpleNamespace(public={"answer": "x"}), "FAIL")
+        self.assertEqual(client.calls["actor"], 3)
+        with self.assertRaises(ValueError):
+            ModelHost(Client([]), memory_attempts=0)
 
     def test_actor_context_goes_to_distillation_but_not_verifier(self):
         memory = {"condition": "input", "action": "add", "outcome": "42",

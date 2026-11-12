@@ -303,6 +303,8 @@ preambles, which have no equivalent here.
 | `core/eyes.py` `imagery.py` `render.py` (610) | `runtime/eyes.py` `imagery.py` `render.py` (235) | QEMU `screendump` → PNG in the standard library, vision question about the capture, pixel-diff and changed-region measurement |
 | `explore/practice_loop.py` (1812) | `runtime/practice_loop.py` (124) | liveness vs boundary vs infrastructure, product resets the stall counter, budget stop is never success |
 | `explore/phase1_wave.py` (844) | `runtime/wave_envelope.py` (100) | the lossless handoff envelope, contradictory decisions refused, saturation gating |
+| `explore/*_recovery.py` (1205) | `runtime/practice_journal.py` (400) |
+  durable digest-chained journal, manifest-checked artifacts, and strict admission: resume from the first uncommitted step, redo only learning when a terminal verdict was saved, never treat an infrastructure stop as progress |
 | `env/controller_oom.py` (60) | `runtime/resource_guard.py` (89) | RSS/CPU/wall ceilings from `/proc`, a guard kill is an infrastructure event |
 | `explore/target_isolation.py` (1284) | `runtime/target_fence.py` (910) + `runtime/guest_relay.py` (85) | exact-`Host` HTTP framing, exact-SNI TLS termination, single-request relays, ephemeral CA, policy digest; enforced by QEMU `restrict=on` plus per-connection `guestfwd` relays instead of iptables in a Docker container |
 
@@ -324,18 +326,39 @@ Not ported, and why:
 
 - **Exact prompt text for every role.** The doctrine is reproduced, not the
   wording. Behaviour that depends on prompt wording has not been compared.
-- **Parallel wave orchestration.** `wave_envelope.py` parses and gates the
-  Curriculum's decision, but a wave still runs one branch at a time; the
-  handoff envelope is not yet consumed by a parallel scheduler.
+- **Parallel wave orchestration from the handoff envelope.**
+  `Protocol.broad_wave(workers=N)` runs attempts in parallel and commits them in
+  task order; `ExploreRun(wave_workers=N)` passes it through. Running attempts in
+  parallel required per-thread attempt state in `vm_client` and `verifier_agent`:
+  a single shared `last_branch` let one attempt's inspector read another attempt's
+  disk and report a confident PASS about work it never saw. What is still not
+  ported is consuming the *envelope* directly: the Curriculum's `WAVE` decision
+  arrives as a task list, not as `projects[]`.
+- **Repeated live parallel waves are limited by the model, not the scheduler.**
+  One clean run: two branches, both writing `/root/proof.txt` with different
+  content, two PASS verdicts, each inspector reading its own branch (5 bytes
+  "alpha", 4 bytes "beta"), 132 s wall clock, both overlays released. Later runs of
+  the same script failed inside memory consolidation: the model kept returning the
+  Actor's own `{"answer", "checks"}` object instead of a four-field lesson, twice
+  in a row, even with the declaration de-quoted and the shape restated. The
+  harness refuses at that point rather than inventing a lesson, so the wave aborts
+  instead of committing unlearned work. `tests/test_parallel_wave.py` proves the
+  concurrency and the thread isolation deterministically; the live run proves the
+  VMs, and its flakiness is the model's.
 - **Verifier recovery and checkpoint machinery** from the 1,345-line upstream
   `verifier_runtime.py`. This plugin's equivalent is the overlay clone: the
   branch is `sync`ed and paused, cloned, inspected and resumed. It is not a
   guest-memory checkpoint, so a state that only exists in guest RAM is not
   visible to the inspector.
-- **Practice recovery procedures** (`practice_evidence_recovery`,
-  `practice_memory_recovery`, `phase1_boundary_recovery`, `phase2_recovery`).
-  `practice_loop.py` classifies and bounds the failure; it does not yet replay
-  the recovery steps.
+- **Per-step practice replay inside the model loop.**
+  `practice_journal.py` replays steps for a caller that can name them, and
+  `Protocol.recover` finishes the case upstream cares most about (terminal verdict
+  saved, learning not committed) without repeating any Actor work. `Protocol.deep`
+  journals whole attempts, not individual model turns, so a crash mid-attempt
+  restarts that attempt rather than resuming its turn. Verified by SIGKILL
+  injection: the killed run resumed at the first uncommitted step, ran each
+  remaining step exactly once, and a corrupted journal was refused rather than
+  guessed.
 - **Upstream's free-form memory tree.** Memory here is the structured snapshot in
   `rsi.py`, not the original tree.
 - **`env/verifier_control.py`.** Upstream needs a host-only virtio-serial port

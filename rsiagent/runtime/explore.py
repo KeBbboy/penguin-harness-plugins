@@ -23,6 +23,10 @@ rather than independent VMs, and no QEMU rollback.
 import json
 import re
 import unicodedata
+from pathlib import Path
+
+import practice_journal
+from practice_loop import PracticeInfrastructureError
 from rsi import Protocol
 from model_host import ChatClient, ModelHost, LLMError
 
@@ -65,7 +69,12 @@ class ExperimentRecord:
 class ExploreRun:
     """One full broad-then-deep exploration over a training domain."""
 
-    def __init__(self, client, max_practices=2, log=None, host=None, held_out=()):
+    def __init__(self, client, max_practices=2, log=None, host=None, held_out=(),
+                 wave_workers=1, journal_dir=None):
+        if type(wave_workers) is not int or wave_workers < 1:
+            raise ValueError("wave_workers must be a positive integer")
+        self.wave_workers = wave_workers
+        self.journal_dir = Path(journal_dir) if journal_dir is not None else None
         self._held_out = {self._task_key(task) for task in held_out}
         self.client = client
         self.curriculum_history = []
@@ -139,8 +148,8 @@ class ExploreRun:
                      for key in selected]
         for task in tasks:
             self._reject_held_out(task)
-        self.record.add("wave_plan", tasks=tasks)
-        verdicts = self.protocol.broad_wave(tasks, workers=1)
+        self.record.add("wave_plan", tasks=tasks, workers=self.wave_workers)
+        verdicts = self.protocol.broad_wave(tasks, workers=self.wave_workers)
         # Only completed and committed outcomes become Curriculum context.
         self.broad_status = "WAVE_COMPLETED"
         self.waves_completed += 1
@@ -153,11 +162,56 @@ class ExploreRun:
         return tasks, verdicts
 
     # --- 2. deep ----------------------------------------------------------
+    def _journal_for(self, target):
+        """The durable practice record for a target, or None when disabled."""
+
+        if self.journal_dir is None:
+            return None
+        name = "deep-{}.json".format(
+            practice_journal.sha256_bytes(target.encode("utf-8"))[:16])
+        return practice_journal.Journal(self.journal_dir / name, target)
+
+    def _admit(self, target, journal):
+        """Read the durable record before any new work is allowed to start."""
+
+        if journal is None or not journal.path.exists():
+            return None
+        return practice_journal.admit(journal.path, target=target)
+
     def deep(self, target):
         self._reject_held_out(target)
-        verdict = self.protocol.deep(target, self.max_practices)
+        journal = self._journal_for(target)
+        admission = self._admit(target, journal)
+        resume_from = 0
+
+        if admission is not None:
+            if admission.kind == practice_journal.INFRASTRUCTURE:
+                raise PracticeInfrastructureError(
+                    "the previous attempt stopped on an infrastructure event: "
+                    + admission.reason)
+            if admission.kind in (practice_journal.ALREADY_COMPLETE,
+                                  practice_journal.STOPPED,
+                                  practice_journal.REDO_LEARNING):
+                recovered = self.protocol.recover(target, journal)
+                self.record.add("deep_recovered", target=target,
+                                recovery=recovered["kind"],
+                                verdict=recovered["verdict"],
+                                steps_committed=admission.steps_committed)
+                return recovered["verdict"]
+            resume_from = admission.steps_committed
+            self.record.add("deep_resumed", target=target,
+                            recovery=admission.kind,
+                            steps_committed=resume_from)
+
+        if journal is not None and not journal.path.exists():
+            journal.start()
+
+        verdict = self.protocol.deep(target, self.max_practices, journal=journal,
+                                     resume_from=resume_from)
         self.record.add("deep", target=target, verdict=verdict,
-                        answer=self.protocol.last_target_answer)
+                        answer=self.protocol.last_target_answer,
+                        steps_committed=(journal.steps_committed()
+                                         if journal is not None else 0))
         return verdict
 
     def deep_unified(self, target):

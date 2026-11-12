@@ -12,6 +12,7 @@ from the task and the machine and judges on evidence alone.
 """
 import json
 import re
+import threading
 
 import checks as checks_module
 import verifier_runtime
@@ -262,7 +263,21 @@ class BranchVerifierHost:
         self.max_rounds = max_rounds
         self.accept_unverified = accept_unverified
         self.boot_timeout = boot_timeout
-        self.last_inspection = None
+        # Per-thread, like the VM client's attempt state: a wave runs several
+        # inspections at once and a shared slot would report another attempt's
+        # result.
+        self._state = threading.local()
+        self.inspections = []
+        self._inspections_lock = threading.Lock()
+
+    @property
+    def last_inspection(self):
+        """This thread's most recent inspection, or None."""
+        return getattr(self._state, "inspection", None)
+
+    @last_inspection.setter
+    def last_inspection(self, value):
+        self._state.inspection = value
 
     def run_actor(self, task, memory):
         return self.model_host.run_actor(task, memory)
@@ -288,6 +303,8 @@ class BranchVerifierHost:
                                       accept_unverified=self.accept_unverified,
                                       boot_timeout=self.boot_timeout)
         self.last_inspection = inspection
+        with self._inspections_lock:
+            self.inspections.append(inspection)
         report = str(inspection.findings)
         punchlist = items_punchlist(inspection.findings)
         if punchlist:

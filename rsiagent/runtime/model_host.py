@@ -126,6 +126,34 @@ def parse_leading_object(text):
     return value
 
 
+def parse_embedded_objects(text):
+    """Every JSON object embedded in text, in order; prose between is allowed.
+
+    A model that drafts, comments on its own draft, then redrafts produces
+    several objects separated by prose. ``parse_repeated_json`` refuses that
+    because the whole text is not JSON, which loses a perfectly usable action.
+    """
+    if not isinstance(text, str):
+        return []
+    decoder = json.JSONDecoder()
+    found = []
+    index = 0
+    length = len(text)
+    while index < length:
+        start = text.find("{", index)
+        if start < 0:
+            break
+        try:
+            value, end = decoder.raw_decode(text[start:])
+        except ValueError:
+            index = start + 1
+            continue
+        if isinstance(value, dict):
+            found.append(value)
+        index = start + end
+    return found
+
+
 def parse_repeated_json(text):
     """Decode one JSON value or multiple identical concatenated values."""
     if not isinstance(text, str):
@@ -257,11 +285,13 @@ CURRICULUM_SYSTEM = (
 
 MEMORY_SYSTEM = (
     "You are the Actor distilling experience from a task attempt and its "
-    "verifier verdict. Return one JSON object with nonempty string fields "
-    "condition, action, outcome, and support. Describe only the supplied task, "
-    "candidate, and verdict; do not invent observations, causal certainty, or "
-    "a successful outcome for a failed attempt. Generalize only when justified; "
-    "include uncertainty in support.")
+    "verifier verdict. Your reply is a LESSON, never the candidate answer and "
+    "never a done declaration: do not echo the quoted candidate, actor response "
+    "or checks. Reply with exactly one JSON object and nothing else, with these "
+    "four nonempty string fields: condition, action, outcome, support. Describe "
+    "only the supplied task, candidate, and verdict; do not invent observations, "
+    "causal certainty, or a successful outcome for a failed attempt. Generalize "
+    "only when justified; include uncertainty in support.")
 
 
 RECONCILE_SYSTEM = (
@@ -272,6 +302,27 @@ RECONCILE_SYSTEM = (
     "JSON object with a lessons array. Each lesson must contain nonempty "
     "condition, action, outcome, support and source_ref fields. Use one exact "
     "source_ref from an input lesson; never invent or merge source references.")
+
+
+def _clip(value, limit=1200):
+    """A quoted value, bounded so a model cannot mistake it for the task."""
+
+    text = "" if value is None else (value if isinstance(value, str)
+                                     else json.dumps(value, ensure_ascii=False))
+    text = " ".join(text.split())
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def _short_answer(public, limit=400):
+    """The attempt's answer, short enough that a model will not copy it whole."""
+
+    value = public.get("answer") if isinstance(public, dict) else public
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    else:
+        text = "" if value is None else str(value)
+    text = " ".join(text.split())
+    return text[:limit] + ("…" if len(text) > limit else "")
 
 
 def _lessons(memory):
@@ -286,7 +337,10 @@ class ModelHost:
     verifier_mode = "model judgment; no container isolation"
 
     def __init__(self, client, actor_max_tokens=4096, curriculum_history=None,
-                 reconcile_memory=False):
+                 reconcile_memory=False, memory_attempts=2):
+        if type(memory_attempts) is not int or memory_attempts < 1:
+            raise ValueError("memory_attempts must be a positive integer")
+        self.memory_attempts = memory_attempts
         self.client = client
         self.actor_max_tokens = actor_max_tokens
         self.curriculum_history = curriculum_history if curriculum_history is not None else []
@@ -355,6 +409,12 @@ class ModelHost:
             text = blocks[0].strip()
         value = parse_repeated_json(text)
         if value is None:
+            # Several objects with prose between: the last one is the reply's
+            # final intent, the same convention the turn parser uses.
+            embedded = parse_embedded_objects(text)
+            if embedded:
+                value = embedded[-1]
+        if value is None:
             # Tolerate prose around one object, but reject conflicting objects.
             first, last = text.find("{"), text.rfind("}")
             if first < 0 or last <= first:
@@ -413,20 +473,55 @@ class ModelHost:
         if not isinstance(history, list):
             # Compatibility with host-supplied candidates that have no session.
             history = []
-        reply = self.client.complete(
-            "actor", MEMORY_SYSTEM,
-            "Task: {}\nCandidate: {}\nActor response: {}\nVerifier verdict: {}\n"
-            "Verifier report: {}\nPrior memory: {}\n"
-            "Distill one supported lesson using your own trajectory:".format(
-                task, json.dumps(candidate.public, ensure_ascii=False),
-                json.dumps(private.get("actor_reply"), ensure_ascii=False),
-                verdict, getattr(verdict, "report", "No detailed verifier report was supplied."),
-                _lessons(memory)),
-            history=history, max_tokens=3072)
-        lesson = self._role_object("memory", reply)
         fields = ("condition", "action", "outcome", "support")
-        if not all(isinstance(lesson.get(k), str) and lesson[k].strip() for k in fields):
-            raise LLMError("memory lesson lacks a required nonempty field")
+        report = (getattr(verdict, "report",
+                          "No detailed verifier report was supplied."))
+        shape = ("Write one lesson as {{\"condition\": ..., \"action\": ..., "
+                 "\"outcome\": ..., \"support\": ...}} — four nonempty "
+                 "strings, no other keys, no prose:")
+        # The first prompt keeps the Actor's own reply so the same Actor distils
+        # what it just did. A model shown a large JSON blob tends to continue
+        # that blob instead of answering (measured: it returned the Actor's own
+        # {"answer", "checks"} object), so the restatement quotes only the
+        # answer.
+        prompt = (
+            "Task: {}\nCandidate (data, do not copy): {}\n"
+            "Actor response (data, do not copy): {}\nVerifier verdict: {}\n"
+            "Verifier report: {}\nPrior memory: {}\n\n{}".format(
+                task,
+                _short_answer(candidate.public),
+                _clip(private.get("actor_reply")),
+                verdict, report, _lessons(memory), shape))
+        retry_prompt = (
+            "Task: {}\nAnswer the attempt produced (data, do not copy): {}\n"
+            "Verifier verdict: {}\nVerifier report: {}\nPrior memory: {}\n\n"
+            "Your previous reply was unusable. {}".format(
+                task, _short_answer(candidate.public), verdict, report,
+                _lessons(memory), shape))
+        lesson = None
+        last_reply = ""
+        for attempt in range(self.memory_attempts):
+            # The first attempt keeps the Actor's own session so the same Actor
+            # distils what it just did. A restatement uses a clean context: a
+            # long VM transcript otherwise drowns the instruction and the model
+            # continues the transcript instead of answering. The trajectory is
+            # already quoted in the prompt, so nothing is lost.
+            reply = self.client.complete(
+                "actor", MEMORY_SYSTEM, prompt if attempt == 0 else retry_prompt,
+                history=history, max_tokens=3072)
+            # Pick the lesson-shaped object, not merely the last object in the
+            # reply: a drafting model often appends a remark object after the
+            # lesson, and "last wins" would take the remark.
+            usable = [item for item in parse_embedded_objects(reply)
+                      if all(isinstance(item.get(k), str) and item[k].strip()
+                             for k in fields)]
+            if usable:
+                lesson = usable[-1]
+                break
+            last_reply = reply
+        if lesson is None:
+            raise LLMError("memory lesson lacks a required nonempty field; "
+                           "last reply was: " + (last_reply or "")[:200])
         # The verifier verdict is retained separately from the model-generated
         # lesson; the lesson is not itself an independently verified fact.
         lesson = {k: lesson[k].strip() for k in fields}

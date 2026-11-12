@@ -11,6 +11,9 @@ from copy import deepcopy
 from dataclasses import dataclass
 from hashlib import sha256
 import json
+from types import SimpleNamespace
+
+import practice_journal
 
 
 def digest(value):
@@ -83,6 +86,7 @@ class Protocol:
         self.events = []
         self.last_wave_answers = []
         self.last_target_answer = None
+        self.last_practice_verdict = None
 
     def _release_candidate(self, candidate):
         release = getattr(self.host, "release_candidate", None)
@@ -151,25 +155,47 @@ class Protocol:
             for candidate, _ in results:
                 self._release_candidate(candidate)
 
-    def deep(self, target, max_practices):
+    def deep(self, target, max_practices, journal=None, resume_from=0):
+        """Attempt the target, practise, and retry it under a budget.
+
+        With ``journal`` the attempt is recorded before it is committed, so a
+        crash between the verdict and the consolidated memory leaves evidence
+        that ``recover`` can finish without repeating any Actor work.
+        """
         if max_practices < 0:
             raise ValueError("max_practices must not be negative")
+        if type(resume_from) is not int or resume_from < 0:
+            raise ValueError("resume_from must be a nonnegative integer")
         if self.training_validator is not None:
             self.training_validator(target)
-        practices = 0
+        practices = resume_from
         while True:
             candidate, verdict = self._attempt(target, self.memory)
+            if journal is not None:
+                journal.append(practice_journal.VERDICT_SAVED, task=target,
+                               verdict=str(verdict),
+                               public=(deepcopy(candidate.public)
+                                       if isinstance(candidate.public, dict) else {}))
             try:
                 self._commit(target, candidate, verdict)
                 self.last_target_answer = (deepcopy(candidate.public.get("answer"))
                                            if isinstance(candidate.public, dict) else None)
             finally:
                 self._release_candidate(candidate)
+            if journal is not None:
+                journal.append(practice_journal.LEARNING_COMMITTED,
+                               verdict=str(verdict))
             decision = self.host.curriculum_review(deepcopy(target), verdict,
                                                    deepcopy(self.memory))
             if decision is None:
+                if journal is not None:
+                    journal.append(practice_journal.PROJECT_CLOSED,
+                                   verdict=str(verdict))
                 return verdict
             if practices >= max_practices:
+                if journal is not None:
+                    journal.append(practice_journal.BUDGET_STOP,
+                                   verdict=str(verdict), practices=practices)
                 return "BUDGET_EXHAUSTED"
             if self.training_validator is not None:
                 self.training_validator(decision)
@@ -179,6 +205,41 @@ class Protocol:
             finally:
                 self._release_candidate(candidate)
             practices += 1
+            self.last_practice_verdict = practice_verdict
+            if journal is not None:
+                journal.append(practice_journal.STEP_COMMITTED, index=practices)
+
+    def recover(self, target, journal):
+        """Finish a stopped attempt from its journal, repeating no Actor work.
+
+        Only the two outcomes that are safe to act on are acted on here: a saved
+        verdict whose learning never committed is consolidated now, and a closed
+        project returns its verdict. Everything else is reported as an admission
+        for the caller to decide, because guessing would attribute work nobody
+        performed.
+        """
+        admission = practice_journal.admit(journal.path, target=target)
+        if admission.kind == practice_journal.REDO_LEARNING:
+            entry = journal.last(practice_journal.VERDICT_SAVED)
+            payload = dict(entry.payload or {})
+            task = payload.get("task", target)
+            verdict = str(payload.get("verdict", ""))
+            candidate = SimpleNamespace(public=deepcopy(payload.get("public") or {}))
+            self._commit(task, candidate, verdict)
+            journal.append(practice_journal.LEARNING_COMMITTED, verdict=verdict,
+                           recovery="redo_learning")
+            journal.append(practice_journal.PROJECT_CLOSED, verdict=verdict,
+                           recovery="redo_learning")
+            return {"kind": admission.kind, "verdict": verdict,
+                    "admission": admission.as_dict()}
+        if admission.kind in (practice_journal.ALREADY_COMPLETE,
+                              practice_journal.STOPPED):
+            entry = journal.last(practice_journal.VERDICT_SAVED)
+            verdict = (str(entry.payload.get("verdict", "")) if entry else "")
+            return {"kind": admission.kind, "verdict": verdict,
+                    "admission": admission.as_dict()}
+        return {"kind": admission.kind, "verdict": "",
+                "admission": admission.as_dict()}
 
     def freeze(self):
         return FrozenMemory.create(self.memory)

@@ -12,6 +12,7 @@ prepared base image, so attempts cannot see each other's files and the disk is
 thrown away at release — the paper's per-branch isolation and rollback.
 """
 import json
+import threading
 
 import actor_protocol
 import checks as checks_module
@@ -32,10 +33,37 @@ class VMClient:
         self.branch_factory = branch_factory
         self.branch_kwargs = branch_kwargs
         self.branches = {}          # id(history) -> (history, branch)
+        self._branches_lock = threading.Lock()
         self.calls = client.calls
         self.completed_branches = []
-        self.last_check_report = None
-        self.last_branch = None
+        self.check_reports = []        # every attempt's gate report, in order
+        # Per-thread attempt state. ``broad_wave`` runs one whole attempt
+        # (actor + verification) per worker thread, so a single shared
+        # attribute would let one attempt's verifier inspect another attempt's
+        # disk and report a confident PASS about work it never saw.
+        self._state = threading.local()
+
+    # --- the attempt this thread is working on ---------------------------
+    @property
+    def last_branch(self):
+        """The branch this thread's attempt worked in, or None."""
+        return getattr(self._state, "branch", None)
+
+    @last_branch.setter
+    def last_branch(self, value):
+        self._state.branch = value
+
+    @property
+    def last_check_report(self):
+        """The check gate's report for this thread's attempt, or None."""
+        return getattr(self._state, "check_report", None)
+
+    @last_check_report.setter
+    def last_check_report(self, value):
+        self._state.check_report = value
+        if value is not None:
+            with self._branches_lock:
+                self.check_reports.append(value)
 
     # --- branch lifecycle -------------------------------------------------
     def _factory(self):
@@ -46,15 +74,20 @@ class VMClient:
 
     def _branch_for(self, history):
         key = id(history)
-        entry = self.branches.get(key)
+        with self._branches_lock:
+            entry = self.branches.get(key)
         if entry is not None and entry[0] is history:
             return entry[1]
+        # Boot outside the lock: a VM takes seconds and other attempts must not
+        # wait behind it.
         branch = self._factory().start()
-        self.branches[key] = (history, branch)
+        with self._branches_lock:
+            self.branches[key] = (history, branch)
         return branch
 
     def release_history(self, history):
-        entry = self.branches.pop(id(history), None)
+        with self._branches_lock:
+            entry = self.branches.pop(id(history), None)
         if entry is not None and entry[0] is history:
             branch = entry[1]
             # Read the size before close(): the overlay is deleted on close.
@@ -66,7 +99,9 @@ class VMClient:
             self.completed_branches.append(size)
 
     def close_all(self):
-        for history, _ in list(self.branches.values()):
+        with self._branches_lock:
+            live = [history for history, _ in self.branches.values()]
+        for history in live:
             self.release_history(history)
 
     # --- completion -------------------------------------------------------
@@ -133,7 +168,16 @@ class VMClient:
                 continue
             decision = self._declaration(reply)
             if decision is None:
-                return reply                     # plain prose/text answer
+                if not self.require_checks:
+                    return reply                 # plain prose/text answer
+                # A reply that is neither an action nor a declaration is not a
+                # done. Accepting it used to turn a model's garbled echo of its
+                # own output into an "answer" that skipped the check gate.
+                prompt = ("That reply was neither a shell request nor a done "
+                          'declaration. Reply with {"vm_run": "<command>"} to work, '
+                          'or declare done with {"answer": ..., "checks": '
+                          '[{"desc": ..., "probe": ...}]}.')
+                continue
             if decision.get("checks") is None:
                 if not self.require_checks:
                     return reply

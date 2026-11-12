@@ -101,6 +101,27 @@ class VMClientTests(unittest.TestCase):
         with self.assertRaises(LLMError):
             client.complete("actor", "s", "u", history=[])
 
+    def test_a_non_action_reply_cannot_become_a_done(self):
+        """A garbled echo of the command output is not an answer."""
+        echo = '{"exit_code": 0, "stdout": "5\\n616c 7068 61  alpha\\n"}'
+        client = self._client([echo, DONE_WITH_CHECK])
+        reply = client.complete("actor", "solve", "task", history=[])
+        self.assertIn('"answer"', reply)
+        self.assertIn("neither a shell request nor a done declaration",
+                      client.client.prompts[1][1])
+        self.assertEqual(client.client.calls["actor"], 2)
+
+    def test_a_run_of_non_actions_exhausts_the_turns_instead_of_answering(self):
+        echo = '{"exit_code": 0, "stdout": "nothing"}'
+        client = self._client([echo, echo, echo], max_commands=2)
+        with self.assertRaises(LLMError):
+            client.complete("actor", "solve", "task", history=[])
+
+    def test_without_require_checks_a_text_answer_is_still_allowed(self):
+        client = self._client(["the answer is 42"], require_checks=False)
+        self.assertEqual(client.complete("actor", "solve", "task", history=[]),
+                         "the answer is 42")
+
     def test_actor_requires_a_history_list(self):
         client = self._client([])
         with self.assertRaises(LLMError):
