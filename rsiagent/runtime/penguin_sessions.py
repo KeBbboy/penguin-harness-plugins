@@ -13,7 +13,8 @@ class PenguinSessionError(RuntimeError):
 
 class PenguinSessions:
     def __init__(self, executable, project, agent, workspace, provider, model,
-                 timeout_seconds=90, runner=subprocess.run):
+                 timeout_seconds=90, runner=subprocess.run, session_factory=None,
+                 session_guard=None):
         if not executable or not all(isinstance(x, str) and x for x in executable):
             raise ValueError("executable must be a nonempty argument list")
         if not all(isinstance(x, str) and x for x in
@@ -25,6 +26,8 @@ class PenguinSessions:
         self.project, self.agent, self.workspace = project, agent, workspace
         self.provider, self.model, self.timeout_seconds = provider, model, timeout_seconds
         self.runner = runner
+        self.session_factory = session_factory
+        self.session_guard = session_guard
 
     def turn(self, message, session_id=None, approve="deny-all"):
         if not isinstance(message, str) or not message.strip():
@@ -32,6 +35,11 @@ class PenguinSessions:
         if approve not in ("deny-all", "read-only", "allow-all", "always-ask"):
             raise ValueError("invalid approval mode")
         args = self.executable + ["run"]
+        if session_id is None and self.session_factory is not None:
+            if approve != "deny-all":
+                raise ValueError("read-only sessions require deny-all approval")
+            session_id = self.session_factory(self.project, self.agent, self.workspace,
+                                              self.provider, self.model)
         if session_id is None:
             args += ["--project-id", self.project, "--agent-id", self.agent,
                      "--workspace", self.workspace, "--provider", self.provider,
@@ -43,11 +51,18 @@ class PenguinSessions:
             raise ValueError("session_id must be a nonempty string")
         args += ["--timeout", str(self.timeout_seconds) + "s",
                  "--json", "--message", message]
+        if self.session_guard is not None:
+            if session_id is None:
+                raise PenguinSessionError("guarded session must be created before execution")
+            self.session_guard(session_id)
         try:
             result = self.runner(args, capture_output=True, text=True,
                                  timeout=self.timeout_seconds + 20, check=False)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise PenguinSessionError("Penguin session execution failed") from exc
+        finally:
+            if self.session_guard is not None:
+                self.session_guard(session_id)
         if result.returncode:
             raise PenguinSessionError("Penguin session exited with code " + str(result.returncode))
         try:
@@ -57,7 +72,7 @@ class PenguinSessions:
         if (not isinstance(output, dict) or output.get("status") != "completed" or
                 not isinstance(output.get("sessionId"), str) or
                 not output["sessionId"].strip() or
-                not isinstance(output.get("text"), str)):
+                not isinstance(output.get("text"), str) or not output["text"].strip()):
             raise PenguinSessionError("Penguin session did not complete with a usable result")
         if session_id is not None and output["sessionId"] != session_id:
             raise PenguinSessionError("Penguin resumed a different session")
@@ -85,6 +100,15 @@ class PenguinRoleClient:
         self.calls = {}
         self.log = log
         self._sessions = {}
+
+    def release_history(self, history):
+        """Drop a coordinator-side session reference without deleting host data."""
+        if history is None:
+            return
+        key = id(history)
+        entry = self._sessions.get(key)
+        if entry is not None and entry[1] is history:
+            del self._sessions[key]
 
     def complete(self, role, system, user, max_tokens=512, temperature=0.0, history=None):
         if role not in self.roles:

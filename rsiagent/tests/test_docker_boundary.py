@@ -22,6 +22,8 @@ class DockerBoundaryTests(unittest.TestCase):
             private = root / "actor-private.txt"
             private.write_text("secret")
             probe = "import pathlib\np=pathlib.Path('/candidate/result.txt')\nassert p.read_text() == 'original'\nassert not pathlib.Path('/actor-private.txt').exists()\nassert not pathlib.Path('/candidate/../actor-private.txt').exists()\nprint('private_hidden')\ntry:\n    p.write_text('changed')\nexcept OSError:\n    print('candidate_readonly')\nelse:\n    raise AssertionError('writable')\n"
+            probe += "\nassert not pathlib.Path(" + repr(str(private)) + ").exists()\n"
+            probe += "assert sorted(x.name for x in pathlib.Path('/candidate').iterdir()) == ['result.txt']\n"
             probe += "\nassert any(line.strip() == 'NoNewPrivs:\t1' for line in open('/proc/self/status'))\n"
             probe += "assert set(__import__('os').listdir('/sys/class/net')) == {'lo'}\n"
             try:

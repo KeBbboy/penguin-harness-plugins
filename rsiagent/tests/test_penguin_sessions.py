@@ -76,6 +76,7 @@ class SessionTests(unittest.TestCase):
 
     def test_detached_or_wrong_session_fails_closed(self):
         for payload in ({"sessionId":"s", "status":"running", "text":""},
+                        {"sessionId":"s", "status":"completed", "text":"  "},
                         {"sessionId":"wrong", "status":"completed", "text":"ok"}):
             runner = lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps(payload))
             host = PenguinSessions(["penguin"], "p", "a", "/w", "c", "m", runner=runner)

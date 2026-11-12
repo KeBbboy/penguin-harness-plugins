@@ -91,6 +91,21 @@ class UnifiedModelHostTests(unittest.TestCase):
         self.assertTrue(host.released)
         self.assertFalse(hasattr(host, "asserted_report"))
 
+    def test_route_prompt_is_constrained_by_verdict(self):
+        from unified import Verification
+        class RouteClient:
+            def __init__(self):
+                self.prompts = []
+            def complete(self, role, system, user, **kwargs):
+                self.prompts.append(user)
+                return '{"decision":"HANDOFF","report":"checked"}'
+        client = RouteClient()
+        host = UnifiedModelHost(client)
+        host.route([], "target", Verification("PASS", "checked"))
+        host.route([], "target", Verification("FAIL", "not checked"))
+        self.assertIn("Allowed decisions for this verdict: HANDOFF or VERIFY_MORE", client.prompts[0])
+        self.assertIn("Allowed decisions for this verdict: REVISE or EVOLVE", client.prompts[1])
+
     def test_revision_reuses_role_histories_without_disclosing_actor_memory(self):
         client = Client()
         result = run_unified(UnifiedModelHost(client), "target", ["memory-secret"])

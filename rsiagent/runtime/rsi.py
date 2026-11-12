@@ -81,13 +81,25 @@ class Protocol:
         self.training_validator = training_validator
         self.memory = deepcopy(memory if memory is not None else [])
         self.events = []
+        self.last_wave_answers = []
+        self.last_target_answer = None
+
+    def _release_candidate(self, candidate):
+        release = getattr(self.host, "release_candidate", None)
+        if release is not None:
+            release(candidate)
 
     def _attempt(self, task, snapshot):
         candidate = self.host.run_actor(deepcopy(task), deepcopy(snapshot))
-        verdict = self.host.verify(deepcopy(task), candidate.public)
-        if verdict not in ("PASS", "FAIL"):
-            raise RuntimeError("verification incomplete; no memory may be committed")
-        return candidate, verdict
+        try:
+            # The verifier inspects a copy, not the Actor's candidate.
+            verdict = self.host.verify(deepcopy(task), deepcopy(candidate.public))
+            if verdict not in ("PASS", "FAIL"):
+                raise RuntimeError("verification incomplete; no memory may be committed")
+            return candidate, verdict
+        except BaseException:
+            self._release_candidate(candidate)
+            raise
 
     def _commit(self, task, candidate, verdict):
         updated = self.host.consolidate(deepcopy(self.memory), deepcopy(task),
@@ -106,21 +118,38 @@ class Protocol:
             for task in tasks:
                 self.training_validator(task)
         snapshot = deepcopy(self.memory)
+        results = []
+        first_error = None
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            results = list(pool.map(lambda task: self._attempt(task, snapshot), tasks))
-        # Stage the whole wave before publishing any memory or commit events.
-        # A later consolidation failure must not leave a partially committed wave.
-        staged = deepcopy(self.memory)
-        staged_events = []
-        for task, (candidate, verdict) in zip(tasks, results):
-            staged = self.host.consolidate(deepcopy(staged), deepcopy(task),
-                                           candidate, verdict)
-            digest(staged)
-            staged = deepcopy(staged)
-            staged_events.append(("commit", verdict))
-        self.memory = staged
-        self.events.extend(staged_events)
-        return [verdict for _, verdict in results]
+            futures = [pool.submit(self._attempt, task, snapshot) for task in tasks]
+            for future in futures:
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+        try:
+            if first_error is not None:
+                raise first_error
+            # Stage the whole wave before publishing any memory or events.
+            staged = deepcopy(self.memory)
+            staged_events = []
+            for task, (candidate, verdict) in zip(tasks, results):
+                staged = self.host.consolidate(deepcopy(staged), deepcopy(task),
+                                               candidate, verdict)
+                digest(staged)
+                staged = deepcopy(staged)
+                staged_events.append(("commit", verdict))
+            answers = [deepcopy(candidate.public.get("answer"))
+                       if isinstance(candidate.public, dict) else None
+                       for candidate, _ in results]
+            self.memory = staged
+            self.events.extend(staged_events)
+            self.last_wave_answers = answers
+            return [verdict for _, verdict in results]
+        finally:
+            for candidate, _ in results:
+                self._release_candidate(candidate)
 
     def deep(self, target, max_practices):
         if max_practices < 0:
@@ -130,7 +159,12 @@ class Protocol:
         practices = 0
         while True:
             candidate, verdict = self._attempt(target, self.memory)
-            self._commit(target, candidate, verdict)
+            try:
+                self._commit(target, candidate, verdict)
+                self.last_target_answer = (deepcopy(candidate.public.get("answer"))
+                                           if isinstance(candidate.public, dict) else None)
+            finally:
+                self._release_candidate(candidate)
             decision = self.host.curriculum_review(deepcopy(target), verdict,
                                                    deepcopy(self.memory))
             if decision is None:
@@ -140,7 +174,10 @@ class Protocol:
             if self.training_validator is not None:
                 self.training_validator(decision)
             candidate, practice_verdict = self._attempt(decision, self.memory)
-            self._commit(decision, candidate, practice_verdict)
+            try:
+                self._commit(decision, candidate, practice_verdict)
+            finally:
+                self._release_candidate(candidate)
             practices += 1
 
     def freeze(self):
@@ -149,7 +186,10 @@ class Protocol:
     def evaluate(self, task, frozen):
         before = frozen.sha256
         candidate, verdict = self._attempt(task, frozen.read())
-        if sha256(frozen._encoded).hexdigest() != before:
-            raise RuntimeError("frozen memory changed")
-        # No curriculum or consolidation after freezing.
-        return candidate, verdict
+        try:
+            if sha256(frozen._encoded).hexdigest() != before:
+                raise RuntimeError("frozen memory changed")
+            # No curriculum or consolidation after freezing.
+            return candidate, verdict
+        finally:
+            self._release_candidate(candidate)

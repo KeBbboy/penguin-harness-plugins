@@ -14,12 +14,126 @@ Every prompt and raw reply can be captured through ``log`` for the
 experiment record; nothing is persisted by the adapters themselves.
 """
 import json
+import re
 import urllib.request
 from types import SimpleNamespace
 
 
 class LLMError(RuntimeError):
     """A role could not produce a usable reply."""
+
+
+def parse_leading_request(text):
+    """Decode an environment-request object at the start of a reply.
+
+    Models sometimes append an invented or pasted observation after their
+    request. Only a leading object whose sole key is a known request key is
+    accepted; anything else is refused, so hallucinated data can never be
+    mistaken for a request or an answer. The real observation is fetched
+    afterwards through the allowlist.
+    """
+    if not isinstance(text, str):
+        return None
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        value, _ = json.JSONDecoder().raw_decode(text[start:])
+    except ValueError:
+        return None
+    if not isinstance(value, dict) or len(value) != 1:
+        return None
+    if set(value) - {"environment_get", "training_judge"}:
+        return None
+    return value
+
+
+_TOOL_MARKUP = re.compile(
+    r'invoke\s+name="(environment_get|training_judge)"[^>]*>\s*(.*?)\s*</', re.S)
+
+
+def parse_tool_markup(text):
+    """Decode a native tool-call block as an environment request.
+
+    Some providers answer with their own tool-call syntax when no tools are
+    declared (DeepSeek emits ``invoke name="environment_get">/path``). The
+    request is executed through the same allowlist, never trusted as data.
+    """
+    if not isinstance(text, str):
+        return None
+    match = _TOOL_MARKUP.search(text)
+    if match is None:
+        return None
+    name, payload = match.group(1), match.group(2).strip()
+    if name == "environment_get" and payload.startswith("/") and " " not in payload:
+        return {"environment_get": payload}
+    return None
+
+
+def parse_leading_object(text):
+    """Decode a single JSON object at the start of text.
+
+    Models sometimes append tool-call markup (for example DeepSeek's
+    ``<｜｜DSML｜｜>`` block) after an otherwise complete JSON object. Accept
+    that object when nothing else in the remainder is an object or array;
+    refuse text that encodes two different values.
+    """
+    if not isinstance(text, str):
+        return None
+    decoder = json.JSONDecoder()
+    start = min([index for index in (text.find("{"), text.find("[")) if index >= 0],
+                default=-1)
+    if start < 0:
+        return None
+    try:
+        value, end = decoder.raw_decode(text[start:])
+    except ValueError:
+        return None
+    rest = text[start + end:]
+    # Refuse a reply that carries a second, different JSON value; prose or
+    # tool-call markup after the object is tolerated. Braces inside that
+    # prose (for example "/api/accounts/{account_id}") are not values.
+    for position, character in enumerate(rest):
+        if character not in "{[":
+            continue
+        try:
+            other, _ = decoder.raw_decode(rest[position:])
+        except ValueError:
+            continue
+        if other != value:
+            return None
+    return value
+
+
+def parse_repeated_json(text):
+    """Decode one JSON value or multiple identical concatenated values."""
+    if not isinstance(text, str):
+        return None
+    decoder = json.JSONDecoder()
+    remaining = text.strip()
+    values = []
+    while remaining:
+        try:
+            value, end = decoder.raw_decode(remaining)
+        except ValueError:
+            return None
+        values.append(value)
+        remaining = remaining[end:].lstrip()
+    try:
+        canonical = [json.dumps(value, sort_keys=True, allow_nan=False) for value in values]
+    except (TypeError, ValueError):
+        return None
+    if canonical and all(value == canonical[0] for value in canonical):
+        return values[0]
+    return None
+
+
+class Verdict(str):
+    """A PASS/FAIL verdict carrying verifier feedback for Actor distillation."""
+    def __new__(cls, verdict, report=""):
+        value = super().__new__(cls, verdict)
+        value.report = report
+        return value
 
 
 class ChatClient:
@@ -42,7 +156,10 @@ class ChatClient:
         text = ""
         last_error = None
         diag = []
-        for budget in (max_tokens, max_tokens + 1024):
+        budgets = [max_tokens]
+        while budgets[-1] < 16384:
+            budgets.append(min(budgets[-1] * 2, 16384))
+        for budget in budgets:
             request = urllib.request.Request(
                 self.base_url + "/chat/completions",
                 data=json.dumps({"model": self.model, "messages": messages,
@@ -88,7 +205,7 @@ ACTOR_SYSTEM = (
     "You are the Actor in the RSIAgent exploration protocol. Solve the task "
     "you are given, using the prior lessons only as hints that may be wrong, "
     "outdated or inapplicable — verify against the task itself. Reply with a "
-    "single JSON object: your solution as \"answer\" (a string or number) and "
+    "single JSON object: your solution as \"answer\" (use the JSON structure required by the task) and "
     "one short sentence of evidence as \"evidence\". No other text.")
 
 VERIFIER_SYSTEM = (
@@ -96,7 +213,8 @@ VERIFIER_SYSTEM = (
     "You see only the task and the candidate's public answer — never the "
     "Actor's reasoning, lessons or memory. Solve the task yourself, then "
     "judge the candidate strictly against your own result and the task's "
-    "requirements. Reply with exactly PASS or FAIL, nothing else.")
+    "requirements. Reply with one JSON object containing verdict (PASS or FAIL) "
+    "and report (specific, observable reasons).")
 
 CURRICULUM_SYSTEM = (
     "You are the Curriculum in the RSIAgent exploration protocol. Review the "
@@ -114,6 +232,16 @@ MEMORY_SYSTEM = (
     "include uncertainty in support.")
 
 
+RECONCILE_SYSTEM = (
+    "You are the same Actor reconciling the complete causal memory after "
+    "distillation. Review all existing lessons and the draft against your "
+    "trajectory and verifier feedback. Remove duplicates and unsupported or "
+    "contradicted claims; narrow uncertain conclusions. Return exactly one "
+    "JSON object with a lessons array. Each lesson must contain nonempty "
+    "condition, action, outcome, support and source_ref fields. Use one exact "
+    "source_ref from an input lesson; never invent or merge source references.")
+
+
 def _lessons(memory):
     if not memory:
         return "(none yet)"
@@ -125,18 +253,28 @@ class ModelHost:
 
     verifier_mode = "model judgment; no container isolation"
 
-    def __init__(self, client, actor_max_tokens=4096):
+    def __init__(self, client, actor_max_tokens=4096, curriculum_history=None,
+                 reconcile_memory=False):
         self.client = client
         self.actor_max_tokens = actor_max_tokens
+        self.curriculum_history = curriculum_history if curriculum_history is not None else []
+        self.reconcile_memory = reconcile_memory
 
     def run_actor(self, task, memory):
+        # Keep the Actor's session through verification and later distillation.
+        # EnvironmentClient appends tool observations to this same history.
+        history = []
         reply = self.client.complete(
             "actor", ACTOR_SYSTEM,
             "Task: {}\n\nPrior lessons (hints, verify before use): {}".format(task, _lessons(memory)),
-            max_tokens=self.actor_max_tokens)
+            history=history, max_tokens=self.actor_max_tokens)
         try:
-            value = json.loads(reply)
-        except json.JSONDecodeError:
+            value = self._role_object("actor", reply)
+        except LLMError:
+            # Keep legacy plain-text answers, but never turn a broken JSON or
+            # Markdown-fenced object into a misleading plain-text answer.
+            if reply.strip().startswith(("{", "[", "```")):
+                raise
             value = {"answer": reply}
         if not isinstance(value, dict) or "answer" not in value:
             raise LLMError("actor reply is not an answer object: " + reply[:200])
@@ -148,50 +286,107 @@ class ModelHost:
                     "evidence": str(value.get("evidence", ""))[:400]},
             # Retained for the same Actor's later distillation. Protocol sends
             # only public to the Verifier, never this private response.
-            private={"actor_reply": reply})
+            private={"actor_reply": reply, "actor_history": history})
 
     def verify(self, task, public):
-        reply = self.client.complete(
-            "verifier", VERIFIER_SYSTEM,
-            "Task: {}\nCandidate answer: {}\nVerdict:".format(task, public["answer"]))
-        verdict = reply.strip().upper()
-        if verdict not in ("PASS", "FAIL"):
-            raise LLMError("verifier returned an invalid verdict: " + reply[:200])
-        return verdict
+        user = "Task: {}\nCandidate answer: {}\nVerdict:".format(
+            task, json.dumps(public["answer"], ensure_ascii=False))
+        if hasattr(self.client, "complete_verifier"):
+            reply = self.client.complete_verifier(VERIFIER_SYSTEM, user,
+                                                  task=task, answer=public["answer"])
+        else:
+            reply = self.client.complete("verifier", VERIFIER_SYSTEM, user)
+        text = reply.strip()
+        if text.upper() in ("PASS", "FAIL"):
+            # Older hosts can return only a verdict; do not invent findings.
+            return Verdict(text.upper(), "No detailed verifier report was supplied.")
+        value = self._role_object("verifier", reply)
+        verdict, report = value.get("verdict"), value.get("report")
+        if (not isinstance(verdict, str) or verdict.strip().upper() not in ("PASS", "FAIL") or
+                not isinstance(report, str) or not report.strip()):
+            raise LLMError("verifier must return PASS/FAIL with a nonempty report")
+        return Verdict(verdict.strip().upper(), report.strip())
 
     @staticmethod
     def _role_object(role, reply):
         text = reply.strip()
-        if text.startswith("```"):
-            lines = text.splitlines()
-            if len(lines) < 3 or lines[-1].strip() != "```":
+        if "```" in text:
+            # One fenced block with an optional language tag; surrounding
+            # prose is allowed. More than one block is ambiguous and refused.
+            blocks = re.findall(r"```(?:[A-Za-z0-9_.+-]+)?[ \t]*\n(.*?)```", text, re.S)
+            if len(blocks) != 1:
                 raise LLMError(role + " response has an invalid JSON fence")
-            text = "\n".join(lines[1:-1]).strip()
-        try:
-            value = json.loads(text)
-        except json.JSONDecodeError:
-            # Tolerate surrounding prose around a single JSON object; the
-            # object itself is still parsed and validated strictly.
+            text = blocks[0].strip()
+        value = parse_repeated_json(text)
+        if value is None:
+            # Tolerate prose around one object, but reject conflicting objects.
             first, last = text.find("{"), text.rfind("}")
             if first < 0 or last <= first:
-                raise LLMError(role + " response is not JSON")
+                raise LLMError(role + " response is not JSON: " + text[:300])
             try:
                 value = json.loads(text[first:last + 1])
             except json.JSONDecodeError as exc:
-                raise LLMError(role + " response is not JSON") from exc
+                raise LLMError(role + " response is not JSON: " + text[:300]) from exc
         if not isinstance(value, dict):
             raise LLMError(role + " response must be a JSON object")
         return value
 
+    def release_candidate(self, candidate):
+        """Forget the Actor's coordinator-side history after an attempt."""
+        private = getattr(candidate, "private", None)
+        history = private.get("actor_history") if isinstance(private, dict) else None
+        if isinstance(history, list):
+            release = getattr(self.client, "release_history", None)
+            if release is not None:
+                release(history)
+            history.clear()
+
+    def reconcile(self, memory, lesson, history):
+        """Reconcile a draft without asking the model to reproduce provenance."""
+        draft = list(memory) + [lesson]
+        sources, visible = {}, []
+        for index, item in enumerate(draft):
+            if not isinstance(item, dict) or not isinstance(item.get("source_task"), str) or item.get("verdict") not in ("PASS", "FAIL"):
+                raise LLMError("memory cannot be reconciled without verified provenance")
+            ref = "L{:04d}".format(index + 1)
+            sources[ref] = (item["source_task"], str(item["verdict"]))
+            visible.append({"source_ref": ref, **{k: item.get(k, "") for k in
+                            ("condition", "action", "outcome", "support")}})
+        reply = self.client.complete("actor", RECONCILE_SYSTEM,
+            "Draft memory: {}\nReconcile the complete memory against the "
+            "available trajectory and verifier evidence.".format(json.dumps(visible, ensure_ascii=False)),
+            history=history, max_tokens=4096)
+        value = self._role_object("memory reconciliation", reply)
+        lessons = value.get("lessons")
+        fields = ("condition", "action", "outcome", "support", "source_ref")
+        if (not isinstance(lessons, list) or len(lessons) > 200 or
+                not all(isinstance(item, dict) and all(isinstance(item.get(k), str) and item[k].strip()
+                        for k in fields) and item["source_ref"] in sources for item in lessons)):
+            raise LLMError("memory reconciliation has invalid lessons or provenance")
+        result = []
+        for item in lessons:
+            source_task, verdict = sources[item["source_ref"]]
+            entry = {key: item[key].strip() for key in fields if key != "source_ref"}
+            entry.update(source_task=source_task, verdict=verdict)
+            result.append(entry)
+        return result
+
     def consolidate(self, memory, task, candidate, verdict):
+        private = getattr(candidate, "private", None) or {}
+        history = private.get("actor_history")
+        if not isinstance(history, list):
+            # Compatibility with host-supplied candidates that have no session.
+            history = []
         reply = self.client.complete(
             "actor", MEMORY_SYSTEM,
             "Task: {}\nCandidate: {}\nActor response: {}\nVerifier verdict: {}\n"
-            "Prior memory: {}\nDistill one supported lesson:".format(
+            "Verifier report: {}\nPrior memory: {}\n"
+            "Distill one supported lesson using your own trajectory:".format(
                 task, json.dumps(candidate.public, ensure_ascii=False),
-                json.dumps(getattr(candidate, "private", None), ensure_ascii=False),
-                verdict, _lessons(memory)),
-            max_tokens=3072)
+                json.dumps(private.get("actor_reply"), ensure_ascii=False),
+                verdict, getattr(verdict, "report", "No detailed verifier report was supplied."),
+                _lessons(memory)),
+            history=history, max_tokens=3072)
         lesson = self._role_object("memory", reply)
         fields = ("condition", "action", "outcome", "support")
         if not all(isinstance(lesson.get(k), str) and lesson[k].strip() for k in fields):
@@ -201,13 +396,16 @@ class ModelHost:
         lesson = {k: lesson[k].strip() for k in fields}
         lesson["verdict"] = verdict
         lesson["source_task"] = task
+        if self.reconcile_memory:
+            return self.reconcile(memory, lesson, history)
         return list(memory) + [lesson]
 
     def curriculum_review(self, task, verdict, memory):
         reply = self.client.complete(
             "curriculum", CURRICULUM_SYSTEM,
             "Target task: {}\nVerifier verdict: {}\nLessons so far: {}\n\n"
-            "Choose readiness or one focused practice task:".format(task, verdict, _lessons(memory)))
+            "Choose readiness or one focused practice task:".format(task, verdict, _lessons(memory)),
+            history=self.curriculum_history)
         decision = self._role_object("curriculum", reply)
         if decision.get("decision") == "ready":
             return None

@@ -16,6 +16,22 @@ If the host cannot isolate roles or enforce read-only memory, explicitly report 
 
 ## PenguinHarness execution
 
+For a standalone text task, when `mcp__rsiagent__rsi_train` is available,
+use that tool to execute training through the protocol core; provide the Project,
+workspace, provider/model, three distinct existing Agent IDs, input and new
+snapshot/report paths. The MCP tools default to host-reported read-only
+Sessions and require host masks covering `PENGUIN_HOME` and the training
+snapshot's parent directory, or the existing snapshot during evaluation. They
+stop if confinement or the required masks cannot be
+confirmed; do not silently disable those requirements. Report `target_status`,
+`broad_status` and `waves_completed`; a created snapshot does not imply that the
+target passed. For held-out text tasks use
+`mcp__rsiagent__rsi_evaluate` with the trusted training digest and the same
+snapshot. These tools use separate role Sessions but do not enforce private-file
+isolation or host-level write protection. They do not operate GDPevo services;
+use the benchmark-authorized workflow for environment tasks and disclose the
+difference. Never pass credentials in tool arguments.
+
 Run as a top-level session with the `run_subagent` tool available. Use fresh,
 separate subagent sessions for Curriculum and Verifier; give each only the inputs
 specified for that role. Actor works in the benchmark-authorized environment.

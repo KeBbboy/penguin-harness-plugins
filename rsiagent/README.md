@@ -23,11 +23,29 @@ reuse.
 - `evaluate` — held-out execution reads only the frozen snapshot; no
   curriculum, no consolidation.
 
+The model-driven exploration path now asks the same Actor to reconcile the
+complete structured memory after distilling each lesson. The model chooses which
+lessons to retain or revise; short references are checked and original task and
+verdict provenance are restored by the host. This is a structured-memory
+adaptation, not the original runtime's free-form memory tree or recovery
+workflow. In unified deep exploration the same Actor also produces a concise
+learning diagnosis after reconciliation, which the persistent Curriculum receives
+before choosing further practice. This handoff has not been validated against the
+original VM-based audit and recovery mechanisms.
+
 `runtime/docker_verifier.py` can run a caller-supplied verifier against a
 read-only candidate in a restricted container. No host directory is mounted
 when no candidate directory is provided. This is an optional boundary, not a VM:
 the default `ModelHost` uses a model-based verdict and does not automatically
 invoke Docker. A caller must explicitly select and test the evidence adapter.
+
+`runtime/frozen_executor.py` also provides a restricted-container execution
+boundary that mounts a trusted snapshot read-only and checks its digest before
+and after execution. The Docker integration test verifies that a process in
+this container can read but cannot overwrite the snapshot. This protection
+does not cover host-side writers, and the PenguinHarness CLI and Skill do not
+yet run their Actor inside this boundary. No host-level write prevention is
+claimed.
 
 ## Not the original runtime
 
@@ -52,6 +70,65 @@ default; `--deep-mode legacy` selects its earlier routing. Neither mode is
 wired into the PenguinHarness Skill or GDPevo. Role histories are separate chat
 contexts, not protected OS environments, and the model verifier is not a grader.
 
+## Experimental HTTP environment observations
+
+The standalone CLI optionally accepts `--environment-url http://127.0.0.1:PORT`
+and one or more `--environment-path /api/prefix` arguments. Actor and Verifier
+can request bounded GET observations from those operator-allowed prefixes; the
+origin must be loopback, redirects are refused, and request count and response
+size are capped. This is an observation adapter, not a benchmark runner, a
+training judge, or an isolation boundary. For the MCP server, the operator
+may set `RSI_ENVIRONMENT_URL` and `RSI_ENVIRONMENT_PATHS` (a JSON array of
+allowed prefixes) in its process environment; tool callers cannot change these.
+The operator may set `--environment-max-requests` (or MCP process environment
+`RSI_ENVIRONMENT_MAX_REQUESTS`) to 1–64 requests per role call; the default is 8.
+In training only, operators can additionally provide `--training-judge-path`
+and repeated `--training-task-id` options. The Verifier may request feedback
+for those IDs using a JSON answer; the Actor cannot call this endpoint. The
+CLI refuses judge configuration during evaluation. For MCP these are set with
+`RSI_TRAINING_JUDGE_PATH` and `RSI_TRAINING_TASK_IDS` (JSON array), and the
+server omits them from evaluation calls. For a labeled training task whose ID
+is allowed, feedback is requested automatically before the Verifier responds;
+the Verifier is therefore informed by the training judge. No held-out benchmark
+score is implied.
+A deterministic fake-model smoke test read `/api/catalog` from the actual
+GDPevo service-ticket training environment on GPU02. No benchmark score was
+produced by this smoke test. The service must be reachable from the CLI process;
+for containerized benchmark trials it must run in the same network namespace.
+
+## Exporting an answer for a benchmark task
+
+`python3 runtime/task_input.py WORKSPACE` emits evaluation input JSON containing
+only `input/prompt.txt` and the UTF-8 files under `input/payloads/`; it rejects
+symlinks and enforces input size limits. It does not read grader files or
+reference answers. Run it inside the evaluation environment and store its JSON
+in a new file. Pass that file to `evaluate --input`, and pass a new path such
+as `--answer-output /app/answer.json` for a single task. The CLI writes the
+Actor's public JSON-object answer without overwriting an existing file; the
+result report also includes that public answer. MCP exposes the equivalent
+`answer_output` argument for `rsi_evaluate`.
+
+The task-input converter has been checked against one GDPevo task's public
+workspace, and output handling has unit tests. `runtime/benchmark_entry.py`
+combines these steps using preconfigured Penguin roles and requests read-only
+Sessions. On an isolated GPU02 Penguin host, it consumed one GDPevo public
+workspace and wrote a synthetic JSON answer using a fake model. The entry now
+requires host sandbox masks for `PENGUIN_HOME` and the frozen snapshot: if these
+paths are not covered, the run fails before an answer is written. This depends
+on the host reporting and enforcing its masks, covers only those paths and any
+extra `--private-path` entries, and does not prevent host-side writes or exclude
+an undetected configuration race. It has not run inside a GDPevo container or
+produced a benchmark score. The caller must provide and verify the server,
+three roles, sandbox, memory boundary, and credentials.
+
+On a new isolated GPU02 service configured to mask its Penguin data root and a
+synthetic frozen snapshot, a fake-model evaluation completed with read-only
+Sessions and both required paths reported masked. In a separate direct call to
+the same bwrap backend with that policy, a synthetic private marker could not
+be read; snapshot reads and writes were denied; its host-side digest remained
+unchanged. This is evidence for those two paths and the tested backend, not a
+proof against all host-side writers, configuration races, or unmasked paths.
+
 ## PenguinHarness session adapter
 
 `runtime/penguin_sessions.py` starts and resumes PenguinHarness CLI sessions
@@ -61,9 +138,70 @@ unified model host to separate role Sessions, requiring distinct Agent IDs;
 a live text-only arithmetic smoke test ran Actor, Verifier and Curriculum in
 three separate PenguinHarness Agent Sessions and reached HANDOFF. This does
 not validate environment tools or operating-system isolation. The standalone
-CLI and installed Skill do not configure this path automatically.
-Separate Sessions do not isolate shared files or protect private memory. Message
-arguments are visible to the host process list; do not put secrets in prompts.
+CLI exposes this path with `--host penguin`. The package also declares an
+MCP server and the Skill references its text-training and evaluation tools.
+An independently named test installation was discovered by a real host Session,
+and its installed server completed a direct MCP evaluation through Actor and
+Verifier. An in-Session model tool invocation has not been verified.
+Separate Sessions do not isolate shared files or protect private memory. In one
+live synthetic probe, a Verifier Session with `deny-all` had both a `read_file`
+and a separate `exec_command` attempt rejected by the host; this tests those
+two approval paths, not all possible host capabilities or OS-level isolation.
+In a separate synthetic Actor probe with `deny-all`, the host rejected both
+a shell read and a `write_file` overwrite attempt; the test file digest stayed
+unchanged. This is approval-gate evidence only, not proof of sandbox enforcement
+or protection when other permissions or tools are enabled.
+Message arguments are visible to the host process list; do not put secrets in
+prompts.
+
+To use the standalone CLI with an existing PenguinHarness Project, supply
+`--host penguin --penguin-executable <path> --project <id> --workspace <path>
+--provider <group> --model <id> --actor-agent <id> --verifier-agent <id>
+--curriculum-agent <id>` along with the ordinary phase and artifact options.
+The three Agent IDs must be distinct and already exist. This mode uses the
+Project's model configuration rather than reading an API key from stdin. It
+does not enforce OS isolation or operate the GDPevo service. An experimental
+`--penguin-read-only` option (MCP: `read_only: true`, the MCP default) requests separate
+read-only Sessions and fails if the host does not report confinement support.
+The MCP default also requires host masks covering `PENGUIN_HOME` and the
+training snapshot's parent directory, or the existing frozen snapshot during
+evaluation. It requires either a current local login in `PENGUIN_HOME` or explicit
+`--penguin-local-api-token`, which uses the local administrative API token.
+On an independent GPU02 service with `penguin-bwrap` active, a direct MCP
+training call completed using a deterministic fake model in read-only Sessions.
+Its report recorded 2 Curriculum, 3 Actor, and 2 Verifier calls and a frozen
+snapshot. This smoke test validates routing, not benchmark performance or
+complete memory isolation.
+Optional `--private-path <absolute-existing-path>` (MCP: `private_paths`)
+checks that each path is covered by the host's configured global mask and that
+the new Session reports masking support. A masked synthetic path was accepted
+and a different unmasked synthetic path rejected on the independent test host.
+This check reads global configuration immediately before and after Session
+creation and rejects a detected change. Each protected role turn also checks the
+Session's reported read-only mode, deny-all approval and mask support before and
+after execution. When required paths are configured, the local adapter also
+opens the host's `web.db` read-only and verifies the exact mask paths stored for
+that Session. This depends on the local host database schema and fails closed
+if it cannot be read. Changes made and reverted between checks remain a race;
+the checks do not establish full Verifier isolation or prevent host-side writes.
+
+## Host sandbox probe
+
+On GPU02, a direct probe of PenguinHarness's Bubblewrap provider reported
+`enforcement=full`, hid a synthetic private file via `maskPaths`, and denied
+a write to a synthetic snapshot under `read-only`. The snapshot stayed
+unchanged. This was a direct provider test, not a PenguinHarness Agent Session:
+the per-Session API accepts mode and network but does not expose per-Session
+`maskPaths`. Later live Session probes confirmed reported masks on an isolated
+host, but do not prove every file or host-side process is isolated.
+
+A separate disposable service with Bubblewrap enabled and a global synthetic
+`maskPaths` setting was also tested using a deterministic local model. In a
+real `read-only` Session with `read-only` approval, ten `read_file` calls
+returned empty contents for the masked synthetic file, with no marker exposure.
+The fake model did not produce a final answer. This verifies the file tool on
+that particular service configuration; the plugin does not yet configure a
+private mask per role or prove isolation for every tool.
 
 ## Known algorithm gaps
 

@@ -21,6 +21,7 @@ reported, not hidden: single shared environment, API-level role isolation
 rather than independent VMs, and no QEMU rollback.
 """
 import json
+import re
 import unicodedata
 from rsi import Protocol
 from model_host import ChatClient, ModelHost, LLMError
@@ -29,19 +30,16 @@ CURRICULUM_PLANNER_SYSTEM = (
     "You are the Curriculum in the RSIAgent exploration protocol, planning "
     "a BROAD wave. Given the training domain description and the lessons so "
     "far, propose a wave of diverse, achievable training tasks that spreads "
-    "coverage wide rather than deep. Reply with a single JSON object "
-    "{\"tasks\": [\"task\", ...]} with 2 to 6 short tasks. No other text.")
+    "coverage wide rather than deep. Reply with one JSON object: either "
+    "{\"decision\":\"WAVE\",\"tasks\":[...]} or "
+    "{\"decision\":\"SATURATED\"|\"STALLED\",\"report\":\"reason\"}. "
+    "SATURATED means further broad exploration is not useful; STALLED means "
+    "you cannot responsibly continue. No other text.")
 
 
 def _parse_tasks(reply, limit=6):
     """Parse the Curriculum's wave plan; tolerate fenced JSON."""
-    text = reply.strip()
-    if text.startswith("```"):
-        text = text.strip("`").split("\n", 1)[-1].strip()
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        raise LLMError("curriculum wave plan is not JSON: " + reply[:200])
+    value = ModelHost._role_object("curriculum", reply)
     tasks = value.get("tasks") if isinstance(value, dict) else None
     if (not isinstance(tasks, list) or not tasks
             or not all(isinstance(t, str) and t.strip() for t in tasks)):
@@ -70,7 +68,12 @@ class ExploreRun:
     def __init__(self, client, max_practices=2, log=None, host=None, held_out=()):
         self._held_out = {self._task_key(task) for task in held_out}
         self.client = client
-        self.host = host if host is not None else ModelHost(client)
+        self.curriculum_history = []
+        self.previous_wave_outcomes = []
+        self.broad_status = "NOT_STARTED"
+        self.waves_completed = 0
+        self.host = host if host is not None else ModelHost(
+            client, curriculum_history=self.curriculum_history, reconcile_memory=True)
         self.record = ExperimentRecord()
         if log is not None:
             self.client.log = log
@@ -90,25 +93,71 @@ class ExploreRun:
             raise ValueError("held-out task cannot be used during exploration")
 
     # --- 1. broad ---------------------------------------------------------
-    def broad(self, domain, wave_size=2):
-        reply = self.client.complete(
-            "curriculum", CURRICULUM_PLANNER_SYSTEM,
-            "Training domain: {}\nLessons so far: {}\n\n"
-            "Plan the next broad wave of training tasks:".format(
-                domain, json.dumps(self.protocol.memory, ensure_ascii=False)))
-        tasks = _parse_tasks(reply, limit=wave_size)
+    def broad(self, domain, wave_size=2, training_tasks=None):
+        prompt = ("Training domain: {}\nLessons so far: {}\n"
+                  "Previous completed wave outcomes: {}\n\n"
+                  "Plan the next broad wave of training tasks:".format(
+                      domain, json.dumps(self.protocol.memory, ensure_ascii=False),
+                      json.dumps(self.previous_wave_outcomes, ensure_ascii=False)))
+        system = CURRICULUM_PLANNER_SYSTEM
+        if training_tasks is not None:
+            if (not isinstance(training_tasks, dict) or not training_tasks or
+                    not all(isinstance(k, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", k)
+                            and isinstance(v, str) and v.strip()
+                            for k, v in training_tasks.items())):
+                raise ValueError("training_tasks must map nonempty IDs to nonempty tasks")
+            for task in training_tasks.values():
+                self._reject_held_out(task)
+            system = ("You are the RSIAgent Curriculum planning a broad wave. "
+                      "Choose diverse tasks only from the provided training catalog. "
+                      "Return JSON with decision WAVE and tasks as distinct catalog IDs, "
+                      "or decision SATURATED or STALLED and a nonempty report. "
+                      "Do not invent IDs.")
+            prompt += "\nTraining catalog (ID to task): " + json.dumps(training_tasks, ensure_ascii=False)
+        reply = self.client.complete("curriculum", system, prompt,
+                                     history=self.curriculum_history)
+        plan = ModelHost._role_object("curriculum", reply)
+        decision = plan.get("decision", "WAVE")
+        if decision in ("SATURATED", "STALLED"):
+            report = plan.get("report")
+            if not isinstance(report, str) or not report.strip() or plan.get("tasks"):
+                raise LLMError("terminal broad decision requires a report and no tasks")
+            self.broad_status = decision
+            self.record.add("broad_terminal", decision=decision, report=report.strip())
+            return [], []
+        if decision != "WAVE":
+            raise LLMError("invalid broad curriculum decision")
+        selected = _parse_tasks(reply, limit=wave_size)
+        if training_tasks is None:
+            tasks = selected
+        else:
+            if len(selected) != len(set(selected)) or any(key not in training_tasks for key in selected):
+                raise LLMError("curriculum must select distinct IDs from the training catalog")
+            # Preserve the operator's ID so a training-only verifier can request
+            # feedback for the same task; task text itself remains unchanged.
+            tasks = ["Training task ID: {}\n{}".format(key, training_tasks[key])
+                     for key in selected]
         for task in tasks:
             self._reject_held_out(task)
         self.record.add("wave_plan", tasks=tasks)
         verdicts = self.protocol.broad_wave(tasks, workers=1)
-        self.record.add("wave_verdicts", tasks=tasks, verdicts=verdicts)
+        # Only completed and committed outcomes become Curriculum context.
+        self.broad_status = "WAVE_COMPLETED"
+        self.waves_completed += 1
+        self.previous_wave_outcomes = [
+            {"task": task, "verdict": str(verdict),
+             "verifier_report": getattr(verdict, "report", "No detailed report supplied.")}
+            for task, verdict in zip(tasks, verdicts)]
+        self.record.add("wave_verdicts", tasks=tasks, verdicts=verdicts,
+                        answers=self.protocol.last_wave_answers)
         return tasks, verdicts
 
     # --- 2. deep ----------------------------------------------------------
     def deep(self, target):
         self._reject_held_out(target)
         verdict = self.protocol.deep(target, self.max_practices)
-        self.record.add("deep", target=target, verdict=verdict)
+        self.record.add("deep", target=target, verdict=verdict,
+                        answer=self.protocol.last_target_answer)
         return verdict
 
     def deep_unified(self, target):
@@ -116,12 +165,17 @@ class ExploreRun:
         from unified import run_unified
         from unified_model_host import UnifiedModelHost
         self._reject_held_out(target)
-        host = UnifiedModelHost(self.client, training_validator=self._reject_held_out)
+        host = UnifiedModelHost(self.client, training_validator=self._reject_held_out,
+                                curriculum_history=self.curriculum_history,
+                                reconcile_memory=True,
+                                previous_wave_outcomes=self.previous_wave_outcomes)
         result = run_unified(host, target, self.protocol.memory,
                              max_practices=self.max_practices)
         self.protocol.memory = result.memory
+        public = getattr(result.candidate, "public", None)
+        answer = public.get("answer") if isinstance(public, dict) else None
         self.record.add("deep_unified", target=target, status=result.status,
-                        events=list(result.events))
+                        answer=answer, events=list(result.events))
         return result.status
 
     # --- 3. freeze ----------------------------------------------------------
@@ -136,7 +190,10 @@ class ExploreRun:
         results = []
         for task in held_out:
             candidate, verdict = self.protocol.evaluate(task, frozen)
-            results.append({"task": task, "verdict": verdict})
+            # Export only the public answer; the Actor's private transcript is
+            # not a benchmark artifact and must not be included in the report.
+            results.append({"task": task, "answer": candidate.public["answer"],
+                            "verdict": verdict})
             self.record.add("eval", task=task, verdict=verdict)
         return results
 
@@ -159,7 +216,8 @@ def run(domain, target, held_out, client, max_practices=2):
     run_state = ExploreRun(client, max_practices=max_practices, held_out=held_out)
     run_state._reject_held_out(target)
     run_state.broad(domain)
-    deep_verdict = run_state.deep(target)
+    deep_verdict = ("BROAD_STALLED" if run_state.broad_status == "STALLED"
+                    else run_state.deep(target))
     frozen = run_state.freeze()
     evals = run_state.evaluate(held_out, frozen)
     report = run_state.report()

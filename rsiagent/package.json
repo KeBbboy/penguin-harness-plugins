@@ -53,6 +53,18 @@
       "skills": [
         "rsiagent"
       ]
-    }
+    },
+    "mcp_servers": [
+      {
+        "name": "rsiagent",
+        "config": {
+          "command": "python3",
+          "args": [
+            "${PLUGIN_ROOT}/runtime/mcp_server.py"
+          ],
+          "timeoutMs": 910000
+        }
+      }
+    ]
   }
 }
