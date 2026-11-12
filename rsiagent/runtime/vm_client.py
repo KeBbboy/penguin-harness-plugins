@@ -13,6 +13,7 @@ thrown away at release — the paper's per-branch isolation and rollback.
 """
 import json
 
+import actor_protocol
 import checks as checks_module
 from model_host import (LLMError, parse_json_sequence, parse_leading_object,
                         parse_repeated_json)
@@ -34,6 +35,7 @@ class VMClient:
         self.calls = client.calls
         self.completed_branches = []
         self.last_check_report = None
+        self.last_branch = None
 
     # --- branch lifecycle -------------------------------------------------
     def _factory(self):
@@ -77,6 +79,7 @@ class VMClient:
         if history is None:
             raise LLMError("the Actor needs a history list to own a branch VM")
         branch = self._branch_for(history)
+        self.last_branch = branch
         task = user.split("\n\nPrior lessons")[0]
         instructions = (
             system + "\nYou work inside a private disposable Linux VM. Request a shell "
@@ -116,6 +119,17 @@ class VMClient:
                     chunks.append("Command: {}\nExit code: {}\nOutput:\n{}".format(
                         command, code, output))
                 prompt = "\n\n".join(chunks)
+                continue
+            program = self._program(reply)
+            if program is not None:
+                if commands_used >= self.max_commands:
+                    raise LLMError("the Actor kept submitting programs after the budget")
+                code, output = self._run_program(branch, program)
+                commands_used += 1
+                if len(output) > 2000:
+                    output = output[:2000] + "\n[output truncated]"
+                prompt = "Program ({}):\n{}\nExit code: {}\nOutput:\n{}".format(
+                    program.lang, program.code[:600], code, output)
                 continue
             decision = self._declaration(reply)
             if decision is None:
@@ -167,6 +181,30 @@ class VMClient:
                 raise LLMError("vm_run must be a nonempty string")
             commands.append(command)
         return commands
+
+    @staticmethod
+    def _program(reply):
+        """A whole-program submission (upstream's primary action channel)."""
+        action = actor_protocol.parse_turn(reply)
+        if action is not None and action.kind == "program":
+            return action.payload
+        return None
+
+    @staticmethod
+    def _run_program(branch, program):
+        """Stage the program in the guest and run it with its interpreter."""
+        import shlex
+        if program.lang in ("python", "python3"):
+            path, runner = "/tmp/rsi_program.py", "python3"
+        elif program.lang in ("bash", "sh", "shell"):
+            path, runner = "/tmp/rsi_program.sh", "bash"
+        else:
+            raise LLMError("unsupported program language: " + str(program.lang))
+        staged = branch.run("cat > {} <<'RSI_PROGRAM_EOF'\n{}\nRSI_PROGRAM_EOF"
+                            .format(path, program.code))
+        if staged[0] != 0:
+            return staged
+        return branch.run("{} {}".format(runner, shlex.quote(path)))
 
     @staticmethod
     def _declaration(reply):

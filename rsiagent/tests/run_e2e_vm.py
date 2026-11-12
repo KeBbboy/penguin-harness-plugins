@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime"))
 from model_host import ChatClient, ModelHost
+from verifier_agent import BranchVerifierHost
 from rsi import Protocol
 from vm_client import VMClient
 
@@ -27,7 +28,8 @@ TASK = ("Create /root/proof.txt containing exactly the text hello-rsi "
 
 chat = ChatClient(BASE, KEY, MODEL, timeout=300)
 vm_client = VMClient(chat, IMAGE, max_commands=8)
-host = ModelHost(vm_client, actor_max_tokens=2048)
+model_host = ModelHost(vm_client, actor_max_tokens=2048)
+host = BranchVerifierHost(model_host, vm_client, chat)
 protocol = Protocol(host)
 
 candidate, verdict = protocol._attempt(TASK, [])
@@ -44,6 +46,8 @@ report = {
     "branches_released": len(vm_client.completed_branches),
     "overlay_bytes": vm_client.completed_branches,
     "checks": vm_client.last_check_report,
+    "inspection": (host.last_inspection.as_dict()
+                   if host.last_inspection else None),
 }
 out = Path(__file__).resolve().parents[1] / "vm-actor-report.json"
 out.write_text(json.dumps(report, ensure_ascii=False, indent=1))

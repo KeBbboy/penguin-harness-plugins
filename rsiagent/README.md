@@ -283,3 +283,62 @@ matching internal digest, provided the trusted digest is protected. It does not
 prevent writes to the snapshot file or authenticate an attacker-controlled
 digest. Report files can contain task information, so store them as private
 experiment artifacts.
+
+## Ported modules and what is not ported
+
+The seven behaviours listed as missing in the earlier report now have modules and
+tests. Coverage is by *mechanism*, not by line count: upstream is 10,865 lines
+across the ported files, this plugin is 2,829. The difference is mostly upstream's
+OSWorld/Docker plumbing, iptables script generation and repeated defensive
+preambles, which have no equivalent here.
+
+| upstream | here | what the port keeps |
+| --- | --- | --- |
+| `core/verifier.py` (1732) | `runtime/verifier_agent.py` (297) | zero-history inspector, three verdicts that are not interchangeable, findings as data (`doubts`, `items`), unsettled-item punch list, read-only probe guard, probe-economy budget, accept only on an evidenced pass |
+| `core/checks.py` (200) | `runtime/checks.py` (191) | model-authored checks, mutation lint, a check that cannot fail is rejected |
+| `core/verifier_runtime.py` (1345) | `runtime/verifier_runtime.py` (93) | a throwaway clone of the branch disk; rollback is deleting the overlay |
+| `core/loop.py` (1805) | `runtime/vm_client.py` + `runtime/context_window.py` (328) | program-submission turns, WORK LOG cap at a line boundary, head+tail trace folding, history folding with a fold count |
+| `core/actor.py` (762) | `runtime/actor_protocol.py` (177) | the shared epistemic core, the Actor system prompt, `parse_turn` with `Program > Look > Ask > Done` precedence and last-of-kind wins |
+| `core/self_evolving_loop.py` (411) | `runtime/evolution_loop.py` (319) | the target cycle state machine, same-Actor learning before the Curriculum, stall → one final test, `UNVERIFIED` as a harness outcome, release exactly once |
+| `core/eyes.py` `imagery.py` `render.py` (610) | `runtime/eyes.py` `imagery.py` `render.py` (235) | QEMU `screendump` → PNG in the standard library, vision question about the capture, pixel-diff and changed-region measurement |
+| `explore/practice_loop.py` (1812) | `runtime/practice_loop.py` (124) | liveness vs boundary vs infrastructure, product resets the stall counter, budget stop is never success |
+| `explore/phase1_wave.py` (844) | `runtime/wave_envelope.py` (100) | the lossless handoff envelope, contradictory decisions refused, saturation gating |
+| `env/controller_oom.py` (60) | `runtime/resource_guard.py` (89) | RSS/CPU/wall ceilings from `/proc`, a guard kill is an infrastructure event |
+| `explore/target_isolation.py` (1284) | `runtime/target_fence.py` (910) + `runtime/guest_relay.py` (85) | exact-`Host` HTTP framing, exact-SNI TLS termination, single-request relays, ephemeral CA, policy digest; enforced by QEMU `restrict=on` plus per-connection `guestfwd` relays instead of iptables in a Docker container |
+
+Two measured limits of this runtime, both hit while building the fence:
+
+- **`guestfwd` with a `-tcp:` target carries one connection per relay for the
+  life of the VM on QEMU 6.2.** Measured: three guest connections, one host
+  connection, one request served, then silence. A page needing HTML, CSS and JS
+  is therefore unusable that way. The `-cmd:` form spawns a fresh process per
+  guest connection (measured: three connections, three processes, three
+  requests), which is why `guest_relay.py` exists.
+- **The relay socket may sit idle for a long time before the guest speaks.**
+  Measured: QEMU connects the host side 39 s before the guest's first request
+  arrives. A 10 s idle deadline closes the socket and silently drops every later
+  request on that relay, so the gateway's guest-side idle allowance is 180 s by
+  default.
+
+Not ported, and why:
+
+- **Exact prompt text for every role.** The doctrine is reproduced, not the
+  wording. Behaviour that depends on prompt wording has not been compared.
+- **Parallel wave orchestration.** `wave_envelope.py` parses and gates the
+  Curriculum's decision, but a wave still runs one branch at a time; the
+  handoff envelope is not yet consumed by a parallel scheduler.
+- **Verifier recovery and checkpoint machinery** from the 1,345-line upstream
+  `verifier_runtime.py`. This plugin's equivalent is the overlay clone: the
+  branch is `sync`ed and paused, cloned, inspected and resumed. It is not a
+  guest-memory checkpoint, so a state that only exists in guest RAM is not
+  visible to the inspector.
+- **Practice recovery procedures** (`practice_evidence_recovery`,
+  `practice_memory_recovery`, `phase1_boundary_recovery`, `phase2_recovery`).
+  `practice_loop.py` classifies and bounds the failure; it does not yet replay
+  the recovery steps.
+- **Upstream's free-form memory tree.** Memory here is the structured snapshot in
+  `rsi.py`, not the original tree.
+- **`env/verifier_control.py`.** Upstream needs a host-only virtio-serial port
+  because its desktop user has sudo disabled. Here the serial console already
+  runs as root and is only reachable by the host process, so the separate
+  privileged transport has no counterpart.

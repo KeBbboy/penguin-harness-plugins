@@ -32,6 +32,14 @@ def clone_overlay(branch, *, boot_timeout=240, **kwargs):
     overlay = getattr(branch, "overlay", None)
     if not overlay:
         raise VerifierRuntimeError("the branch has no overlay disk to clone")
+    # The Actor's VM must not write while the clone reads the same file. Flush
+    # the guest cache, freeze the vCPUs, then boot the clone; ``resume`` is the
+    # caller's job so the Actor can continue if verification bounces.
+    try:
+        branch.sync()
+        branch.pause()
+    except AttributeError:
+        pass                      # a branch without a monitor channel
     clone = VMBranch(overlay, boot_timeout=boot_timeout, **kwargs)
     clone.start()
     return clone
