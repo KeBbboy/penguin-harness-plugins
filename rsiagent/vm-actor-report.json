@@ -1,0 +1,19 @@
+{
+ "model": "deepseek-v4.1-flash",
+ "image": "/home/yichen/vm-prep.qcow2",
+ "task": "Create /root/proof.txt containing exactly the text hello-rsi (no trailing newline), then report the file's sha256 checksum.",
+ "answer": {
+  "sha256": "ee1baaaefe8be0b82e1128af30037938596fbb62f0b4d81563991e3115a32d0a",
+  "file": "/root/proof.txt",
+  "content": "hello-rsi"
+ },
+ "verifier_verdict": "PASS",
+ "role_calls": {
+  "actor": 3,
+  "verifier": 1
+ },
+ "branches_released": 1,
+ "overlay_bytes": [
+  385482752
+ ]
+}

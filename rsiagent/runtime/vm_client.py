@@ -48,11 +48,13 @@ class VMClient:
         entry = self.branches.pop(id(history), None)
         if entry is not None and entry[0] is history:
             branch = entry[1]
+            # Read the size before close(): the overlay is deleted on close.
+            size = getattr(branch, "overlay_bytes", 0)
             try:
                 branch.close()
             except Exception:  # a released branch must never mask a real error
                 pass
-            self.completed_branches.append(getattr(branch, "overlay_bytes", 0))
+            self.completed_branches.append(size)
 
     def close_all(self):
         for history, _ in list(self.branches.values()):

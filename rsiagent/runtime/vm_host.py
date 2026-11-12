@@ -16,16 +16,91 @@ Requirements on the prepared base image (see log/vm_prepare.sh):
   - kernel command line contains console=ttyS0,115200n8
   - serial-getty@ttyS0 is enabled with autologin enabled
 """
+import atexit
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _END = "__RSI_END__"
+
+
+_BRANCHES = set()
+_REGISTRY_LOCK = threading.Lock()
+_HOOKS_INSTALLED = False
+
+
+def _close_all_branches(*_args):
+    """Best-effort teardown for every live branch (atexit / signal)."""
+    with _REGISTRY_LOCK:
+        branches = list(_BRANCHES)
+    for branch in branches:
+        try:
+            branch.close()
+        except Exception:
+            pass
+
+
+def _install_hooks():
+    """Kill branch VMs when the interpreter exits or is asked to stop.
+
+    ``timeout`` and Ctrl-C deliver SIGTERM/SIGINT; without this the QEMU
+    process outlives the Python driver and keeps the overlay open.
+    """
+    global _HOOKS_INSTALLED
+    if _HOOKS_INSTALLED:
+        return
+    _HOOKS_INSTALLED = True
+    atexit.register(_close_all_branches)
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def _handler(signum, frame):
+        _close_all_branches()
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            pass
+
+
+def _socket_is_live(path):
+    """A console socket with no listener is a leftover, not a live branch."""
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(1.0)
+    try:
+        probe.connect(path)
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+def cleanup_stale_dirs(prefix="rsi-vm-", root="/tmp"):
+    """Remove overlay directories left behind by a killed driver."""
+    removed = 0
+    for name in os.listdir(root):
+        if not name.startswith(prefix):
+            continue
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        sock_path = os.path.join(path, "console.sock")
+        if os.path.exists(sock_path) and _socket_is_live(sock_path):
+            continue  # a live branch owns it
+        shutil.rmtree(path, ignore_errors=True)
+        removed += 1
+    return removed
 
 
 class VMError(RuntimeError):
@@ -88,8 +163,11 @@ class VMBranch:
         ]
         if self.sudo:
             argv = ["sudo", "-n"] + argv
+        _install_hooks()
         self.proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.PIPE)
+        with _REGISTRY_LOCK:
+            _BRANCHES.add(self)
         self._connect()
         self._wait_for_shell()
         return self
@@ -191,6 +269,11 @@ class VMBranch:
         return code, "\n".join(lines).strip("\n")
 
     def close(self):
+        with _REGISTRY_LOCK:
+            _BRANCHES.discard(self)
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         if self.sock is not None:
             try:
                 self.sock.close()

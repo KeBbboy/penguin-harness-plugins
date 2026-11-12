@@ -303,6 +303,16 @@ class ModelHost:
             # only public to the Verifier, never this private response.
             private={"actor_reply": reply, "actor_history": history})
 
+    def release_candidate(self, candidate):
+        """Free whatever the attempt owns (a branch VM, an observation loop)."""
+        private = getattr(candidate, "private", None) or {}
+        history = private.get("actor_history")
+        if isinstance(history, list):
+            release = getattr(self.client, "release_history", None)
+            if release is not None:
+                release(history)
+            history.clear()
+
     def verify(self, task, public):
         user = "Task: {}\nCandidate answer: {}\nVerdict:".format(
             task, json.dumps(public["answer"], ensure_ascii=False))

@@ -30,6 +30,9 @@ host = ModelHost(vm_client, actor_max_tokens=2048)
 protocol = Protocol(host)
 
 candidate, verdict = protocol._attempt(TASK, [])
+# _attempt alone does not own the branch; the protocol's wave/deep paths
+# release after commit. Do the same here so the VM and its overlay go away.
+protocol._release_candidate(candidate)
 report = {
     "model": MODEL,
     "image": IMAGE,
