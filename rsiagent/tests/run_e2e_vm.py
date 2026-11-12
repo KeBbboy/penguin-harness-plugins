@@ -22,7 +22,8 @@ MODEL = os.environ.get("RSI_MODEL", "deepseek-v4.1-flash")
 IMAGE = os.environ.get("RSI_VM_BASE", "/home/yichen/vm-prep.qcow2")
 
 TASK = ("Create /root/proof.txt containing exactly the text hello-rsi "
-        "(no trailing newline), then report the file's sha256 checksum.")
+        "(no trailing newline), then report the file's sha256 checksum. "
+        "Declare done with machine-run checks.")
 
 chat = ChatClient(BASE, KEY, MODEL, timeout=300)
 vm_client = VMClient(chat, IMAGE, max_commands=8)
@@ -42,6 +43,7 @@ report = {
     "role_calls": dict(chat.calls),
     "branches_released": len(vm_client.completed_branches),
     "overlay_bytes": vm_client.completed_branches,
+    "checks": vm_client.last_check_report,
 }
 out = Path(__file__).resolve().parents[1] / "vm-actor-report.json"
 out.write_text(json.dumps(report, ensure_ascii=False, indent=1))

@@ -70,6 +70,27 @@ def parse_tool_markup(text):
     return None
 
 
+def parse_json_sequence(text):
+    """Decode every JSON value in text, in order; None if any part is not JSON.
+
+    Models often batch several requests in one reply:
+        {"vm_run": "ls /root"}\n{"vm_run": "cat /root/out.txt"}
+    """
+    if not isinstance(text, str):
+        return None
+    decoder = json.JSONDecoder()
+    remaining = text.strip()
+    values = []
+    while remaining:
+        try:
+            value, end = decoder.raw_decode(remaining)
+        except ValueError:
+            return None
+        values.append(value)
+        remaining = remaining[end:].lstrip()
+    return values or None
+
+
 def parse_leading_object(text):
     """Decode a single JSON object at the start of text.
 
