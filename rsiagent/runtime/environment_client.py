@@ -14,6 +14,10 @@ from model_host import (LLMError, ModelHost, parse_leading_object,
                         parse_tool_markup)
 
 
+class EnvironmentBudgetExceeded(LLMError):
+    """The model kept requesting observations after the budget ran out."""
+
+
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
@@ -229,7 +233,8 @@ class EnvironmentClient:
                 # turn. Return one object for the downstream role parser.
                 return final_reply(json.dumps(value, ensure_ascii=False))
             if request_count == self.max_requests:
-                raise LLMError("invalid or excessive environment requests")
+                raise EnvironmentBudgetExceeded(
+                    "invalid or excessive environment requests")
             if set(value) == {"environment_get"}:
                 observation = self._get(value["environment_get"])
             elif set(value) == {"training_judge"} and can_judge:

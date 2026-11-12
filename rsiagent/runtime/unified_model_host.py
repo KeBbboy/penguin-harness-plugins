@@ -6,6 +6,7 @@ This adapter cannot operate benchmark services or certify factual correctness.
 import json
 from copy import deepcopy
 from types import SimpleNamespace
+from environment_client import EnvironmentBudgetExceeded
 from model_host import ModelHost, LLMError, MEMORY_SYSTEM
 from unified import Verification
 
@@ -53,10 +54,19 @@ class UnifiedModelHost:
                                     max_tokens=max_tokens)
 
     def actor_work(self, attempt, target, memory, feedback):
-        response = self._complete("actor", ACTOR,
-            "Task: {}\nMemory: {}\nFeedback: {}".format(
-                target, json.dumps(memory, ensure_ascii=False), feedback or "none"),
-            attempt.actor, max_tokens=4096)
+        try:
+            response = self._complete("actor", ACTOR,
+                "Task: {}\nMemory: {}\nFeedback: {}".format(
+                    target, json.dumps(memory, ensure_ascii=False), feedback or "none"),
+                attempt.actor, max_tokens=4096)
+        except EnvironmentBudgetExceeded:
+            # The observation budget ran out before the Actor answered. Record
+            # the attempt as an answerless failure; the run continues and the
+            # Verifier still judges it.
+            return SimpleNamespace(
+                public={"answer": "",
+                        "evidence": "observation budget exhausted before an answer"},
+                private={"actor_reply": "", "budget_exhausted": True})
         value = ModelHost._role_object("actor", response)
         answer = value.get("answer")
         if answer is None and set(value) and not (
