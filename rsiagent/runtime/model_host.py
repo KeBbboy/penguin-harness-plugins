@@ -276,8 +276,12 @@ class ModelHost:
             if reply.strip().startswith(("{", "[", "```")):
                 raise
             value = {"answer": reply}
-        if not isinstance(value, dict) or "answer" not in value:
+        if not isinstance(value, dict):
             raise LLMError("actor reply is not an answer object: " + reply[:200])
+        if "answer" not in value and value and not (
+                {"environment_get", "training_judge"} & set(value)):
+            # The task defined its own answer schema; the object is the answer.
+            value = {"answer": value}
         answer = value.get("answer")
         if answer is None or (isinstance(answer, str) and not answer.strip()):
             raise LLMError("actor reply has an empty answer")

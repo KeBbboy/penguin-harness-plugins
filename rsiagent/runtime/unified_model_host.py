@@ -59,6 +59,10 @@ class UnifiedModelHost:
             attempt.actor, max_tokens=4096)
         value = ModelHost._role_object("actor", response)
         answer = value.get("answer")
+        if answer is None and set(value) and not (
+                {"environment_get", "training_judge"} & set(value)):
+            # The task defined its own answer schema; the object is the answer.
+            answer = value
         if answer is None or (isinstance(answer, str) and not answer.strip()):
             raise LLMError("actor answer missing")
         return SimpleNamespace(public={"answer": answer, "evidence": value.get("evidence", "")},
