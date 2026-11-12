@@ -54,6 +54,8 @@ def main(argv=None, key_stream=None):
     parser.add_argument("--training-judge-path", help="operator-enabled training feedback path")
     parser.add_argument("--training-task-id", action="append", default=[])
     parser.add_argument("--model", required=True)
+    parser.add_argument("--vm-base-image",
+                        help="prepared qcow2 base image; gives each Actor attempt a disposable VM")
     parser.add_argument("--model-timeout", type=int, default=180,
                         help="seconds per model request (30-900)")
     parser.add_argument("--penguin-executable", default="penguin")
@@ -133,6 +135,9 @@ def main(argv=None, key_stream=None):
         # Long reasoning turns on large observation contexts need more
         # headroom than the client default.
         client.timeout = args.model_timeout
+        if args.vm_base_image:
+            from vm_client import VMClient
+            client = VMClient(client, args.vm_base_image)
     else:
         role_ids = {"actor": args.actor_agent, "verifier": args.verifier_agent,
                     "curriculum": args.curriculum_agent}
