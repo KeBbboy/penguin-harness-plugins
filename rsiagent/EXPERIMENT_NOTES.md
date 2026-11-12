@@ -50,3 +50,25 @@ snapshot digest was
 This validates integration with synthetic responses, not model performance,
 host-side write protection, or the original VM-based isolation and recovery.
 Artifacts: `/home/yichen/rsiagent-penguin/experiments/rsi-hosted-protocol-retry-7hi7pt8f/`.
+
+## Real-model training on the GDPevo train environment (current implementation)
+
+- Environment: the task group's own support-console API started locally
+  (`TASKS/env/setup.sh`, `127.0.0.1:9003`), with the train-only judge enabled
+  (`TASK_ENV_ENABLE_JUDGE=1`). Model `deepseek-v4.1-flash` through the
+  OpenAI-compatible endpoint; entry point `runtime/cli.py train`
+  (`--host chat`, `--environment-max-requests 16`).
+- The run completed and wrote a frozen snapshot:
+  `snapshot.json` digest
+  `6456636d376a21c49682f045dae53e8342b2ccac4a1bce51cf3b80ac676b4e0c`,
+  1 structured lesson, mode 0600.
+- Role calls: Curriculum 6, Actor 54, Verifier 46. `target_status: STALLED`,
+  `broad_status: WAVE_LIMIT_REACHED`, one wave.
+- What this establishes: the current implementation drives real roles against
+  the real GDPevo training API and its train-only judge, and produces a
+  loadable, digest-checked snapshot. What it does not establish: a solved
+  target (the run stalled), benchmark performance (the Verifier here is model
+  judgment with train-judge feedback, not the benchmark's container verifier),
+  or host isolation (`--host chat`; no masking configured).
+- Artifacts: `/home/yichen/rsiagent-penguin/experiments/real-model-train-current/`
+  (`input.json`, `report.json`, `snapshot.json`).
