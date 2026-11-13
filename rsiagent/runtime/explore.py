@@ -257,7 +257,7 @@ class ExploreRun:
             "lessons": len(self.protocol.memory),
             "events": self.record.dump(),
             "deviations": [
-                "single shared environment; branches run sequentially, not in independent VMs",
+                "branch concurrency is configured per wave; isolation depends on the configured client",
                 "verifier mode: " + getattr(self.host, "verifier_mode", "caller-supplied"),
                 "no claim of independent VM isolation or QEMU rollback",
             ],

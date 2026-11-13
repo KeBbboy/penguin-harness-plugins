@@ -97,6 +97,9 @@ class VMClient:
             except Exception:  # a released branch must never mask a real error
                 pass
             self.completed_branches.append(size)
+        release = getattr(self.client, "release_history", None)
+        if release is not None:
+            release(history)
 
     def close_all(self):
         with self._branches_lock:

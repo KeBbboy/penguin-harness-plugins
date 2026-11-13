@@ -1,6 +1,6 @@
 """Run the text-only RSIAgent protocol with persisted train/evaluation state.
 
-This CLI does not implement a benchmark environment adapter or sandbox. Do not
+Environment observations and optional Actor VMs are operator configured. Do not
 treat its model-based verifier as a benchmark score. In chat mode the API key
 is read from standard input and is never written to the report or snapshot.
 Penguin mode uses the host Project's existing model configuration.
@@ -78,7 +78,18 @@ def main(argv=None, key_stream=None):
     parser.add_argument("--answer-output", type=Path, help="create a JSON answer for a single evaluation task")
     parser.add_argument("--expected-digest", help="trusted training snapshot SHA-256 (required for evaluate)")
     parser.add_argument("--deep-mode", choices=("unified", "legacy"), default="unified")
+    parser.add_argument("--wave-workers", type=int, default=1, help="concurrent broad-wave attempts (1-6)")
+    parser.add_argument("--journal-dir", type=Path, help="existing directory for legacy deep-practice recovery")
     args = parser.parse_args(argv)
+    _integer(args.wave_workers, "wave-workers", 1, 6)
+    _integer(args.model_timeout, "model-timeout", 30, 900)
+    if args.phase != "train" and (args.wave_workers != 1 or args.journal_dir is not None):
+        raise ValueError("wave workers and journal are only valid for training")
+    if args.journal_dir is not None:
+        if args.deep_mode != "legacy":
+            raise ValueError("--journal-dir requires --deep-mode legacy")
+        if not args.journal_dir.is_dir():
+            raise ValueError("--journal-dir must be an existing directory")
     if args.answer_output is not None:
         if args.phase != "evaluate":
             raise ValueError("answer output is only valid for evaluation")
@@ -100,6 +111,8 @@ def main(argv=None, key_stream=None):
             snapshot = args.snapshot.resolve(strict=True)
             if not snapshot.is_file():
                 raise ValueError("evaluation snapshot must be a file")
+            if snapshot.stat().st_nlink != 1:
+                raise ValueError("protected snapshot must not have hard-link aliases")
             args.private_path.append(str(snapshot))
         else:
             # The future snapshot does not exist yet. Mask its existing parent
@@ -135,9 +148,6 @@ def main(argv=None, key_stream=None):
         # Long reasoning turns on large observation contexts need more
         # headroom than the client default.
         client.timeout = args.model_timeout
-        if args.vm_base_image:
-            from vm_client import VMClient
-            client = VMClient(client, args.vm_base_image)
     else:
         role_ids = {"actor": args.actor_agent, "verifier": args.verifier_agent,
                     "curriculum": args.curriculum_agent}
@@ -149,17 +159,24 @@ def main(argv=None, key_stream=None):
             from penguin_readonly import create_readonly_session, verify_readonly_session
             auth_mode = "local-api-token" if args.penguin_local_api_token else "cookie"
             session_factory = partial(create_readonly_session,
-                auth_mode=auth_mode, private_paths=args.private_path)
+                auth_mode=auth_mode, private_paths=args.private_path,
+                require_no_network=args.protect_private)
         roles = {role: PenguinSessions([args.penguin_executable], args.project, agent,
                                        args.workspace, args.provider, args.model,
                                        **({"session_factory": session_factory,
                                            "session_guard": partial(verify_readonly_session,
                                                args.project, agent, auth_mode=auth_mode,
                                                require_masks=bool(args.private_path),
-                                               required_paths=tuple(args.private_path))}
+                                               required_paths=tuple(args.private_path),
+                                               require_no_network=args.protect_private)}
                                           if session_factory is not None else {}))
                  for role, agent in role_ids.items()}
+        for role in roles.values():
+            role.timeout_seconds = args.model_timeout
         client = PenguinRoleClient(roles)
+    if args.vm_base_image:
+        from vm_client import VMClient
+        client = VMClient(client, args.vm_base_image)
     if args.phase != "train" and (args.training_judge_path or args.training_task_id):
         raise ValueError("training judge is unavailable during evaluation")
     if args.environment_url or args.environment_path or args.training_judge_path or args.training_task_id:
@@ -191,7 +208,8 @@ def main(argv=None, key_stream=None):
             if not any(target == "Training task ID: {}\n{}".format(key, value)
                        for key, value in training_tasks.items()):
                 raise ValueError("target must exactly match a task in the training catalog")
-        run = ExploreRun(client, max_practices=practices, held_out=exclusions)
+        run = ExploreRun(client, max_practices=practices, held_out=exclusions,
+                         wave_workers=args.wave_workers, journal_dir=args.journal_dir)
         run._reject_held_out(target)
         if training_tasks is not None:
             for task in training_tasks.values():
@@ -215,7 +233,8 @@ def main(argv=None, key_stream=None):
                        "snapshot_digest": frozen.sha256, "waves": waves,
                        "waves_completed": run.waves_completed, "broad_status": run.broad_status,
                        "wave_size": wave_size, "max_practices": practices,
-                       "deep_mode": args.deep_mode, "host": args.host,
+                       "deep_mode": args.deep_mode, "wave_workers": args.wave_workers,
+                       "journal_enabled": args.journal_dir is not None, "host": args.host,
                        "host_reported_read_only": args.penguin_read_only,
                        "required_masked_paths": len(args.private_path)})
     else:

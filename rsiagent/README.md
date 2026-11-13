@@ -365,3 +365,46 @@ Not ported, and why:
   because its desktop user has sudo disabled. Here the serial console already
   runs as root and is only reachable by the host process, so the separate
   privileged transport has no counterpart.
+
+### Runtime options for waves, recovery and VMs
+
+Training accepts `--wave-workers 1..6` to control concurrent broad attempts.
+`--deep-mode legacy --journal-dir /existing/directory` enables practice journal
+recovery; the unified deep mode does not yet support journaling. The journal
+records deep attempts only: restarting training still reruns broad exploration.
+The MCP training tool exposes `wave_workers`, `deep_mode`, and `journal_dir`.
+
+Both chat and Penguin CLI hosts can opt into `--vm-base-image /path/to/base.qcow2`.
+For MCP, the operator may set `RSI_VM_BASE_IMAGE` instead of exposing VM image
+selection to the model. This enables Actor branch VMs; it does not by itself
+prove verifier isolation, snapshot write protection, or GDPevo compatibility.
+The MCP execution timeout defaults to 7200 seconds and can be configured by
+the operator through `RSI_EXECUTION_TIMEOUT` (1 to 14400 seconds).
+For MCP, operators can set `RSI_MODEL_TIMEOUT` (30 to 900 seconds) to control each Penguin role call.
+
+### Protected Penguin sessions
+
+The protected path (`--host penguin --penguin-read-only --protect-private`;
+MCP read-only default) requires a local bwrap backend and the operator must set
+its `sandbox-bwrap.runner` to the absolute path of this installation's
+`runtime/rsi_bwrap.sh`. The wrapper adds PID, IPC and UTS namespaces. The
+coordinator checks the configured runner and wrapper bytes, requests a
+read-only Session with `network: none`, and verifies the saved policy and
+required path masks before and after each turn. The host data directory and
+frozen snapshot must already be covered by the host's mask configuration.
+Protected evaluation rejects a snapshot with hard-link aliases.
+
+The model connection and optional allowlisted task-environment observations
+are made by the trusted host, outside the role command sandbox. On GPU02 a
+separate configured host completed a synthetic protected evaluation; direct
+bwrap probes rejected reading masked synthetic private data, reading or
+replacing the synthetic snapshot, reading other process command lines, and
+connecting to a loopback server. The probe's file digest remained unchanged.
+
+These checks cover the tested sandboxed command boundary and named paths, not
+all possible host tools, Unix-domain sockets, unmasked copies, configuration
+races, privileged or same-user host-side writers, or a compromised host. The
+wrapper configuration is operator-managed; protected runs fail closed if it is
+absent. Read-only and digest checks do not guarantee immutable storage against
+the host. Chat mode, opting out of `protect-private`, and the earlier scored
+GDPevo run do not obtain these protections.

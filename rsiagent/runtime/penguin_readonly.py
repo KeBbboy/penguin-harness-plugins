@@ -1,7 +1,8 @@
 """Create a read-only PenguinHarness Session using a local sign-in cookie.
 
 This requests host confinement and checks the reported mode and support.
-It does not mask Actor-private paths or prove the backend's enforcement.
+For protected sessions, require configured private-path masks and no network.
+Host-side writers and other unmasked private locations remain outside this boundary.
 """
 import json
 from datetime import datetime, timezone
@@ -28,6 +29,31 @@ def _host_masks(client, server, headers):
     if not isinstance(masks, list) or not all(isinstance(x, str) for x in masks):
         raise ValueError("invalid host mask configuration")
     return tuple(masks)
+
+
+_WRAPPER_CONTENT = '#!/bin/sh\nexec bwrap --unshare-pid --unshare-ipc --unshare-uts "$@"\n'
+
+
+def _assert_isolation_runner(client, server, headers):
+    """Require the supplied namespace wrapper on the dedicated local host.
+
+    This checks operator configuration and the installed wrapper bytes; it does
+    not defend against a privileged host changing either between checks.
+    """
+    request = urllib.request.Request(server.rstrip("/") + "/api/admin/plugin-config",
+                                     headers=headers, method="GET")
+    with client.open(request, timeout=15) as response:
+        config = json.load(response)
+    groups = config.get("plugins", []) if isinstance(config, dict) else []
+    group = next((x for x in groups if isinstance(x, dict) and x.get("name") == "sandbox-bwrap"), {})
+    values = group.get("values", {}) if isinstance(group, dict) else {}
+    runner = values.get("runner") if isinstance(values, dict) else None
+    wrapper = Path(__file__).with_name("rsi_bwrap.sh").resolve(strict=True)
+    if (not isinstance(runner, str) or not Path(runner).is_absolute() or
+            Path(runner).resolve(strict=True) != wrapper or
+            wrapper.read_text(encoding="utf-8") != _WRAPPER_CONTENT or
+            not os.access(wrapper, os.X_OK)):
+        raise RuntimeError("protected sessions require the RSIAgent bwrap namespace wrapper")
 
 
 def _local_connection(root, auth_mode):
@@ -76,7 +102,8 @@ def _local_connection(root, auth_mode):
     return server, headers
 
 
-def _assert_readonly_session(session, project, agent, session_id=None, require_masks=False):
+def _assert_readonly_session(session, project, agent, session_id=None, require_masks=False,
+                             require_no_network=False):
     sandbox = session.get("sandbox", {}) if isinstance(session, dict) else {}
     sid = session.get("sessionId") if isinstance(session, dict) else None
     if (not isinstance(sid, str) or not sid or (session_id is not None and sid != session_id) or
@@ -84,12 +111,14 @@ def _assert_readonly_session(session, project, agent, session_id=None, require_m
             session.get("approvalMode") != "deny-all" or not isinstance(sandbox, dict) or
             sandbox.get("mode") != "read-only" or sandbox.get("confinementSupported") is not True or
             (require_masks and (sandbox.get("maskPathsSupported") is not True or
-                                sandbox.get("masksPaths") is not True))):
+                                sandbox.get("masksPaths") is not True)) or
+            (require_no_network and (sandbox.get("network") != "none" or
+                                     sandbox.get("noNetworkSupported") is not True))):
         raise RuntimeError("host did not confirm a supported read-only session")
     return sid
 
 
-def _verify_saved_policy(root, project, agent, session_id, required_paths):
+def _verify_saved_policy(root, project, agent, session_id, required_paths, require_no_network=False):
     """Check this local host's saved Session policy, without writing its DB.
 
     The local SQLite layout is host-version dependent; missing or incompatible
@@ -112,7 +141,8 @@ def _verify_saved_policy(root, project, agent, session_id, required_paths):
         if not isinstance(policy, dict):
             raise ValueError("invalid saved sandbox policy")
         masks = policy.get("maskPaths")
-        if policy.get("mode") != "read-only" or not isinstance(masks, list):
+        if (policy.get("mode") != "read-only" or not isinstance(masks, list) or
+                (require_no_network and policy.get("network") != "none")):
             raise ValueError("missing saved masks")
         covered = [Path(item).resolve(strict=True) for item in masks
                    if isinstance(item, str) and Path(item).is_absolute()]
@@ -126,7 +156,8 @@ def _verify_saved_policy(root, project, agent, session_id, required_paths):
 
 
 def verify_readonly_session(project, agent, session_id, *, root=None, opener=None,
-                            auth_mode="cookie", require_masks=False, required_paths=()):
+                            auth_mode="cookie", require_masks=False, required_paths=(),
+                            require_no_network=False):
     """Fail closed if an existing role Session no longer reports its policy."""
     server, headers = _local_connection(root, auth_mode)
     url = server.rstrip("/") + "/api/sessions/" + quote(session_id, safe="")
@@ -138,14 +169,18 @@ def verify_readonly_session(project, agent, session_id, *, root=None, opener=Non
     except Exception as exc:
         raise RuntimeError("unable to inspect read-only PenguinHarness session") from exc
     session = result.get("session", {}) if isinstance(result, dict) else {}
-    sid = _assert_readonly_session(session, project, agent, session_id, require_masks)
-    if required_paths:
-        _verify_saved_policy(root, project, agent, sid, required_paths)
+    if require_no_network:
+        _assert_isolation_runner(client, server, headers)
+    sid = _assert_readonly_session(session, project, agent, session_id, require_masks,
+                                   require_no_network)
+    if required_paths or require_no_network:
+        _verify_saved_policy(root, project, agent, sid, required_paths, require_no_network)
     return sid
 
 
 def create_readonly_session(project, agent, workspace, provider, model, *,
-                            root=None, opener=None, auth_mode="cookie", private_paths=()):
+                            root=None, opener=None, auth_mode="cookie", private_paths=(),
+                            require_no_network=False):
     server, headers = _local_connection(root, auth_mode)
     required_paths = []
     for value in private_paths:
@@ -158,12 +193,15 @@ def create_readonly_session(project, agent, workspace, provider, model, *,
             raise ValueError("private path must exist") from exc
     url = server.rstrip("/") + "/api/projects/" + quote(project, safe="") + "/agents/" + quote(agent, safe="") + "/sessions"
     body = {"workspace": workspace, "provider": provider, "modelId": model,
-            "approvalMode": "deny-all", "sandbox": {"mode": "read-only", "network": "open"}}
+            "approvalMode": "deny-all", "sandbox": {"mode": "read-only",
+                        "network": "none" if require_no_network else "open"}}
     request = urllib.request.Request(url, data=json.dumps(body).encode(),
                                      method="POST", headers=headers)
     try:
         client = opener or urllib.request.build_opener(
             urllib.request.ProxyHandler({}), _NoRedirect())
+        if require_no_network:
+            _assert_isolation_runner(client, server, headers)
         if required_paths:
             masks = _host_masks(client, server, headers)
             covered = []
@@ -181,9 +219,12 @@ def create_readonly_session(project, agent, workspace, provider, model, *,
             result = json.load(response)
         if required_paths and _host_masks(client, server, headers) != masks:
             raise RuntimeError("host mask configuration changed during session creation")
+        if require_no_network:
+            _assert_isolation_runner(client, server, headers)
     except (ValueError, RuntimeError):
         raise
     except Exception as exc:
         raise RuntimeError("unable to create read-only PenguinHarness session") from exc
     session = result.get("session", {}) if isinstance(result, dict) else {}
-    return _assert_readonly_session(session, project, agent, require_masks=bool(required_paths))
+    return _assert_readonly_session(session, project, agent, require_masks=bool(required_paths),
+                                    require_no_network=require_no_network)

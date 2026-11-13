@@ -213,7 +213,9 @@ class VMBranch:
             # is how a rendered claim gets settled.
             "-monitor", "unix:{},server=on,wait=off".format(self.monitor_path),
         ]
-        argv.extend(self.net_args)
+        # QEMU otherwise creates a default user-mode NIC even when no
+        # explicit network arguments were supplied.
+        argv.extend(self.net_args if self.net_args else ("-nic", "none"))
         if self.sudo:
             argv = ["sudo", "-n"] + argv
         _install_hooks()

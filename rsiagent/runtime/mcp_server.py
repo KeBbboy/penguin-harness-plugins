@@ -1,7 +1,7 @@
 """Stdio MCP bridge to the RSIAgent PenguinHarness text protocol.
 
-This tool does not implement environment isolation, filesystem write protection,
-or GDPevo execution. It uses the host Project's model configuration.
+Actor VMs and read-only Sessions are operator configured; they do not establish
+full environment isolation or benchmark grading. Uses the host model configuration.
 """
 import json
 import os
@@ -14,6 +14,9 @@ _REQUIRED = ("project", "workspace", "provider", "model", "actor_agent",
 _PROPERTIES = {key: {"type": "string", "minLength": 1} for key in _REQUIRED}
 _PROPERTIES["expected_digest"] = {"type": "string", "minLength": 64, "maxLength": 64}
 _PROPERTIES["answer_output"] = {"type": "string", "minLength": 1, "description": "Optional new JSON answer file for a single evaluation task."}
+_PROPERTIES["wave_workers"] = {"type": "integer", "minimum": 1, "maximum": 6}
+_PROPERTIES["journal_dir"] = {"type": "string", "minLength": 1}
+_PROPERTIES["deep_mode"] = {"type": "string", "enum": ["unified", "legacy"]}
 _PROPERTIES["read_only"] = {"type": "boolean", "description": "Request host-enforced read-only Sessions (default true); false explicitly selects the unisolated text pilot."}
 _PROPERTIES["private_paths"] = {"type": "array", "items": {"type": "string", "minLength": 1},
                                  "description": "Existing absolute paths that must be masked in host configuration."}
@@ -44,6 +47,17 @@ def call_tool(name, arguments, runner=subprocess.run):
         raise ValueError("answer_output requires an evaluation and a nonempty path")
     if "read_only" in arguments and type(arguments["read_only"]) is not bool:
         raise ValueError("read_only must be a boolean")
+    if any(k in arguments for k in ("wave_workers", "journal_dir", "deep_mode")) and name != "rsi_train":
+        raise ValueError("training options require rsi_train")
+    if "wave_workers" in arguments and (type(arguments["wave_workers"]) is not int or
+                                        not 1 <= arguments["wave_workers"] <= 6):
+        raise ValueError("wave_workers must be an integer from 1 to 6")
+    if "deep_mode" in arguments and arguments["deep_mode"] not in ("unified", "legacy"):
+        raise ValueError("invalid deep_mode")
+    if "journal_dir" in arguments and (not isinstance(arguments["journal_dir"], str) or
+                                        not arguments["journal_dir"].strip() or
+                                        arguments.get("deep_mode", "unified") != "legacy"):
+        raise ValueError("journal_dir requires a path and legacy deep_mode")
     private_paths = arguments.get("private_paths", [])
     if not isinstance(private_paths, list) or not all(
             isinstance(path, str) and path.strip() for path in private_paths):
@@ -55,6 +69,22 @@ def call_tool(name, arguments, runner=subprocess.run):
                "--host", "penguin"]
     for key in _REQUIRED:
         command.extend(["--" + key.replace("_", "-"), arguments[key]])
+    for option in ("wave_workers", "journal_dir", "deep_mode"):
+        if option in arguments:
+            command.extend(["--" + option.replace("_", "-"), str(arguments[option])])
+    # Request budgets and VM selection are trusted operator configuration.
+    model_timeout = os.environ.get("RSI_MODEL_TIMEOUT")
+    if model_timeout is not None:
+        try:
+            model_timeout_value = int(model_timeout)
+        except ValueError as exc:
+            raise ValueError("operator model timeout must be an integer") from exc
+        if not 30 <= model_timeout_value <= 900:
+            raise ValueError("operator model timeout must be between 30 and 900 seconds")
+        command.extend(["--model-timeout", str(model_timeout_value)])
+    vm_image = os.environ.get("RSI_VM_BASE_IMAGE")
+    if vm_image:
+        command.extend(["--vm-base-image", vm_image])
     if name == "rsi_evaluate":
         command.extend(["--expected-digest", arguments["expected_digest"]])
         if "answer_output" in arguments:
@@ -113,8 +143,14 @@ def call_tool(name, arguments, runner=subprocess.run):
     if executable:
         command.extend(["--penguin-executable", executable])
     try:
+        timeout = int(os.environ.get("RSI_EXECUTION_TIMEOUT", "7200"))
+    except ValueError as exc:
+        raise ValueError("operator execution timeout must be an integer") from exc
+    if not 1 <= timeout <= 14400:
+        raise ValueError("operator execution timeout must be between 1 and 14400 seconds")
+    try:
         result = runner(command, input="", capture_output=True, text=True,
-                        timeout=900, check=False)
+                        timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError("RSIAgent execution did not complete") from exc
     if result.returncode:

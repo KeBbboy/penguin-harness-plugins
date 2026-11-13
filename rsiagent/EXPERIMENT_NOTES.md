@@ -72,3 +72,47 @@ Artifacts: `/home/yichen/rsiagent-penguin/experiments/rsi-hosted-protocol-retry-
   or host isolation (`--host chat`; no masking configured).
 - Artifacts: `/home/yichen/rsiagent-penguin/experiments/real-model-train-current/`
   (`input.json`, `report.json`, `snapshot.json`).
+
+## Current Penguin protocol: service-ticket exploratory run
+
+On GPU02, the working tree based on commit `7dcefd2` ran the modified CLI
+against `deepseek-v4.1-flash`. Training used five public training tasks, one
+two-attempt wave, two wave workers, legacy deep mode and one practice. It
+completed with `BUDGET_EXHAUSTED`, three lessons and role calls Curriculum
+3, Actor 84, Verifier 70. Frozen snapshot SHA-256:
+`30d484f4c23179fca50b407e017dff9b9544770acf400d9c8882939894151edb`.
+
+The five held-out test questions scored by their original graders were
+0.764706, 0.0, 0.823529, 0.363636 and 0.285714 (mean 0.447517).
+The second task initially failed with no usable Penguin session result and
+was retried once; the retry and subsequent tasks used a 300-second model
+timeout. Digest checks passed in every successful evaluation.
+
+This is an exploratory single-scenario run, not a formal isolated benchmark:
+Penguin sessions were not verified read-only or filesystem-isolated, and test
+questions shared a separately started, judge-disabled service instead of fresh
+per-task containers. No matched baseline was run. It does not prove snapshot
+write protection, privacy isolation, or improvement over baseline. The model
+returned a valid frozen snapshot despite the training target remaining unsolved.
+Artifacts: `/home/yichen/rsiagent-penguin/experiments/rsi-real-current-2ncdqxbz/`.
+
+## GPU02 protected-session boundary checks
+
+A dedicated Penguin host was configured with the RSIAgent bwrap namespace
+wrapper. A synthetic-model `evaluate` invocation completed with separate
+Actor and Verifier Sessions and the frozen digest unchanged. Session creation
+and saved policy inspection confirmed read-only mode, no network, and masks
+covering the host data root and a frozen snapshot.
+
+A direct synthetic bwrap command using that wrapper and corresponding masks
+could not read Actor-private data or the snapshot, overwrite or replace the
+snapshot, inspect another process's command line or open its file descriptor,
+or connect to a host loopback listener. The snapshot's post-run hash matched.
+A snapshot with a second hard link was rejected by the protected CLI before
+evaluation. These are focused probes, not proof against every host tool or
+host-side writer. Before adding the namespace wrapper the same synthetic
+command-line probe could read another process's command line.
+
+The 0.447517 GDPevo mean above predates these isolation changes and was
+obtained without the protected path. No new real-model protected benchmark
+run or matched baseline is claimed.
